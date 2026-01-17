@@ -1,0 +1,1011 @@
+Directory structure:
+└── fugue-os/
+    ├── Cargo.toml
+    ├── kernel_brain.onnx
+    └── src/
+        ├── boot.rs
+        ├── desktop.rs
+        ├── hardware.rs
+        └── main.rs
+
+================================================
+FILE: Cargo.toml
+================================================
+[package]
+name = "fugue-os"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ndarray = "0.17.2"
+ort = { version = "2.0.0-rc.11", features = ["ndarray"] }
+rand = "0.9.2"
+raylib = "5.5.1"
+
+
+
+================================================
+FILE: kernel_brain.onnx
+================================================
+[Binary file]
+
+
+================================================
+FILE: src/boot.rs
+================================================
+use raylib::prelude::*;
+
+pub struct BootSequence {
+    logs: Vec<String>,
+    visible_count: usize,
+    timer: f32,
+    pub is_finished: bool,
+    scroll_offset: usize,
+}
+
+impl BootSequence {
+    pub fn new() -> Self {
+        // The "Hardcoded Aesthetic" logs
+        let logs = vec![
+            "Loading NEURO_KERNEL v0.9.2...".to_string(),
+            "Mounting Virtual File System (VFS)...".to_string(),
+            "Initializing Neural Weights...".to_string(),
+            "Allocating Tensor Memory [256MB]...".to_string(),
+            "Calibrating GAN Discriminator...".to_string(),
+            "Connecting to Local LLM Bus...".to_string(),
+            "Verifying GNN Node Integrity...".to_string(),
+            "Starting Process Scheduler (RL-Agent)...".to_string(),
+            "Loading User Space Drivers...".to_string(),
+            "Mounting /dev/neural_net...".to_string(),
+            "Checking VRAM Health...".to_string(),
+            "Optimizing Hyperplane Boundaries...".to_string(),
+            "Loading Desktop Environment...".to_string(),
+            "Starting Window Compositor...".to_string(),
+            "Establishing Uplink...".to_string(),
+            "System Ready.".to_string(),
+        ];
+
+        Self {
+            logs,
+            visible_count: 0,
+            timer: 0.0,
+            is_finished: false,
+            scroll_offset: 0,
+        }
+    }
+
+    pub fn update(&mut self, dt: f32) {
+        if self.is_finished { return; }
+
+        self.timer += dt;
+
+        // Speed of scrolling (0.1 = 100ms per line)
+        // Make it faster towards the end for realism
+        let speed = if self.visible_count < 5 { 0.3 } else { 0.15 };
+
+        if self.timer > speed {
+            self.timer = 0.0;
+            if self.visible_count < self.logs.len() {
+                self.visible_count += 1;
+                
+                // Auto-scroll logic: Keep the last 25 lines visible
+                if self.visible_count > 25 {
+                    self.scroll_offset = self.visible_count - 25;
+                }
+            } else {
+                // Add a small delay at the end before finishing
+                if self.timer > 1.0 { 
+                    self.is_finished = true; 
+                }
+                // Hack: force finish after a moment
+                self.is_finished = true;
+            }
+        }
+    }
+
+    pub fn draw(&self, d: &mut RaylibDrawHandle) {
+        d.clear_background(Color::BLACK);
+
+        let start_x = 20;
+        let mut y = 20;
+        let line_height = 20;
+
+        // Draw visible lines based on scroll offset
+        for i in self.scroll_offset..self.visible_count {
+            if i >= self.logs.len() { break; }
+
+            // Draw the "[  OK  ]" part
+            d.draw_text("[", start_x, y, 20, Color::WHITE);
+            d.draw_text(" OK ", start_x + 10, y, 20, Color::GREEN);
+            d.draw_text("]", start_x + 58, y, 20, Color::WHITE);
+
+            // Draw the message
+            d.draw_text(&self.logs[i], start_x + 80, y, 20, Color::WHITE);
+
+            y += line_height;
+        }
+
+        // Draw a blinking cursor at the bottom
+        if (d.get_time() * 2.0) as i32 % 2 == 0 {
+            d.draw_rectangle(start_x, y + 5, 10, 15, Color::WHITE);
+        }
+    }
+}
+
+
+
+================================================
+FILE: src/desktop.rs
+================================================
+use raylib::prelude::*;
+use crate::hardware::{VirtualHardware, BlockType, KernelMindset};
+use std::collections::VecDeque;
+
+pub struct Theme {
+    pub win_bg: Color,
+    pub border_active: Color,
+    pub border_inactive: Color,
+    pub header_active: Color,
+    pub header_inactive: Color,
+    pub text: Color,
+    pub text_dim: Color,
+    pub accent: Color,
+    pub glitch: Color,
+}
+
+const CYBER_THEME: Theme = Theme {
+    win_bg: Color::new(15, 15, 20, 245), // Slightly transparent dark
+    border_active: Color::new(200, 200, 200, 255),
+    border_inactive: Color::new(60, 60, 70, 255),
+    header_active: Color::new(40, 40, 50, 255),
+    header_inactive: Color::new(25, 25, 30, 255),
+    text: Color::RAYWHITE,
+    text_dim: Color::GRAY,
+    accent: Color::new(0, 255, 200, 255), // Cyan/Teal
+    glitch: Color::MAGENTA,
+};
+
+#[derive(Clone, PartialEq)]
+pub enum AppType {
+    SysMonitor,
+    Terminal,
+    FileUniverse,
+}
+
+pub struct Window {
+    pub title: String,
+    pub rect: Rectangle,
+    pub app_type: AppType,
+    pub is_open: bool,
+    pub process_id: Option<u32>,
+}
+
+struct DragContext {
+    is_dragging: bool,
+    window_idx: usize,
+    offset_x: f32,
+    offset_y: f32,
+}
+
+pub struct DesktopEnv {
+    pub windows: Vec<Window>,
+    drag_ctx: Option<DragContext>,
+    mouse_trail: VecDeque<Vector2>,
+    pub wallpaper: Option<Texture2D>,
+}
+
+impl DesktopEnv {
+    pub fn new() -> Self {
+        Self {
+            windows: Vec::new(),
+            drag_ctx: None,
+            mouse_trail: VecDeque::new(),
+            wallpaper: None,
+        }
+    }
+
+    pub fn open_window(&mut self, hw: &mut VirtualHardware, app_type: AppType) {
+        let (title, w, h, cpu_cost, ram_cost) = match app_type {
+            AppType::SysMonitor => ("NEURAL MONITOR", 600.0, 400.0, 0.1, 5),
+            AppType::Terminal => ("NEURO_SHELL", 500.0, 300.0, 0.05, 2),
+            AppType::FileUniverse => ("GNN FILE SYSTEM", 500.0, 500.0, 0.2, 10),
+        };
+
+        let pid = hw.spawn_process(title, cpu_cost, ram_cost, true);
+        let offset = (self.windows.len() as f32) * 30.0;
+        
+        self.windows.push(Window {
+            title: title.to_string(),
+            rect: Rectangle::new(50.0 + offset, 50.0 + offset, w, h),
+            app_type,
+            is_open: true,
+            process_id: Some(pid),
+        });
+    }
+
+    pub fn close_window(&mut self, hw: &mut VirtualHardware, index: usize) {
+        if let Some(pid) = self.windows[index].process_id {
+            hw.kill_process(pid);
+        }
+        self.windows.remove(index);
+    }
+
+    pub fn update(&mut self, rl: &RaylibHandle, hw: &mut VirtualHardware) {
+        let mouse_pos = rl.get_mouse_position();
+        let screen_w = rl.get_screen_width() as f32;
+        let screen_h = rl.get_screen_height() as f32;
+        let taskbar_h = 40.0;
+
+        // Ghost Trail
+        self.mouse_trail.push_front(mouse_pos);
+        if self.mouse_trail.len() > 20 { self.mouse_trail.pop_back(); }
+
+        // Dragging
+        if let Some(ctx) = &self.drag_ctx {
+            if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) {
+                if ctx.window_idx < self.windows.len() {
+                    let win = &mut self.windows[ctx.window_idx];
+                    let mut new_x = mouse_pos.x - ctx.offset_x;
+                    let mut new_y = mouse_pos.y - ctx.offset_y;
+                    new_x = new_x.clamp(0.0, screen_w - win.rect.width);
+                    new_y = new_y.clamp(0.0, screen_h - win.rect.height - taskbar_h);
+                    win.rect.x = new_x;
+                    win.rect.y = new_y;
+                }
+            } else {
+                self.drag_ctx = None;
+            }
+        } else if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+            let mut action_close = None;
+            let mut action_focus = None;
+            let mut should_drag = false;
+
+            for (i, win) in self.windows.iter().enumerate().rev() {
+                if !win.is_open { continue; }
+
+                if win.rect.check_collision_point_rec(mouse_pos) {
+                    let close_hitbox = Rectangle::new(win.rect.x + win.rect.width - 30.0, win.rect.y, 30.0, 30.0);
+                    let title_hitbox = Rectangle::new(win.rect.x, win.rect.y, win.rect.width - 30.0, 30.0);
+
+                    if close_hitbox.check_collision_point_rec(mouse_pos) {
+                        action_close = Some(i);
+                    } else {
+                        should_drag = title_hitbox.check_collision_point_rec(mouse_pos);
+                        action_focus = Some(i);
+
+                        // --- 2. FILE INTERACTION: CLICK DETECTION ---
+                        if win.app_type == AppType::FileUniverse {
+                            // Replicate the offset logic from draw()
+                            let inner_x = win.rect.x + 10.0;
+                            let inner_y = win.rect.y + 40.0;
+                            let inner_w = win.rect.width - 20.0;
+                            let inner_h = win.rect.height - 50.0;
+                            
+                            let win_center_x = inner_x + (inner_w / 2.0);
+                            let win_center_y = inner_y + (inner_h / 2.0);
+                            let offset_x = win_center_x - 400.0;
+                            let offset_y = win_center_y - 300.0;
+
+                            // Check nodes
+                            let mut clicked_node = None;
+                            for node in &hw.files {
+                                let nx = node.x + offset_x;
+                                let ny = node.y + offset_y;
+                                // Simple circle collision (radius 6.0 for easier clicking)
+                                let dx = mouse_pos.x - nx;
+                                let dy = mouse_pos.y - ny;
+                                if dx*dx + dy*dy < 36.0 {
+                                    clicked_node = Some(node.id);
+                                    break;
+                                }
+                            }
+                            
+                            // Update Hardware State
+                            hw.selected_file_id = clicked_node;
+                            
+                            // "Interaction Stress": Spike CPU slightly on click
+                            if clicked_node.is_some() {
+                                hw.system_state.cpu_pressure = (hw.system_state.cpu_pressure + 0.05).min(1.0);
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+
+            if let Some(index) = action_close {
+                self.close_window(hw, index);
+            } else if let Some(index) = action_focus {
+                let window = self.windows.remove(index);
+                self.windows.push(window);
+                if should_drag {
+                    let new_index = self.windows.len() - 1;
+                    let win = &self.windows[new_index];
+                    self.drag_ctx = Some(DragContext {
+                        is_dragging: true,
+                        window_idx: new_index,
+                        offset_x: mouse_pos.x - win.rect.x,
+                        offset_y: mouse_pos.y - win.rect.y,
+                    });
+                }
+            }
+        }
+    }
+
+    pub fn draw(&mut self, d: &mut RaylibDrawHandle, hw: &VirtualHardware) {
+        let screen_w = d.get_screen_width();
+        let screen_h = d.get_screen_height();
+
+
+
+        if let Some(tex) = &self.wallpaper {
+            // Draw texture scaled to screen size
+            let source_rec = Rectangle::new(0.0, 0.0, tex.width as f32, tex.height as f32);
+            let dest_rec = Rectangle::new(0.0, 0.0, screen_w as f32, screen_h as f32);
+            d.draw_texture_pro(tex, source_rec, dest_rec, Vector2::zero(), 0.0, Color::WHITE);
+        } else {
+            // Fallback to original grid code
+            d.clear_background(Color::new(10, 10, 15, 255));
+
+            for i in (0..screen_w).step_by(50) {
+                d.draw_line(i, 0, i, screen_h, Color::new(255, 255, 255, 5));
+            }
+
+            for i in (0..screen_h).step_by(50) {
+                d.draw_line(0, i, screen_w, i, Color::new(255, 255, 255, 5));
+            }
+        }
+
+        // Ghost Trail
+        for (i, pos) in self.mouse_trail.iter().enumerate() {
+            let alpha = 100 - (i * 5);
+            if alpha > 0 {
+                d.draw_circle_v(*pos, 5.0, Color::new(0, 255, 255, alpha as u8));
+            }
+        }
+
+        d.draw_fps(10,10);
+
+        // Windows
+        for (i, window) in self.windows.iter().enumerate() {
+            if !window.is_open { continue; }
+            let is_active = i == self.windows.len() - 1;
+            
+            // Use the helper to draw the frame
+            self.draw_window_frame(d, window, is_active, |d, inner_rect| {
+                match window.app_type {
+                    AppType::SysMonitor => self.draw_sys_monitor(d, hw, inner_rect),
+                    AppType::Terminal => self.draw_terminal(d, hw, inner_rect),
+                    AppType::FileUniverse => self.draw_file_universe(d, hw, inner_rect),
+                }
+            });
+        }
+
+        self.draw_taskbar(d, hw, screen_w, screen_h);
+    }
+
+    // --- HELPER: UNIFIED WINDOW FRAME ---
+    fn draw_window_frame<F>(&self, d: &mut RaylibDrawHandle, win: &Window, is_active: bool, content: F)
+    where F: FnOnce(&mut RaylibDrawHandle, Rectangle) {
+        let x = win.rect.x as i32;
+        let y = win.rect.y as i32;
+        let w = win.rect.width as i32;
+        let h = win.rect.height as i32;
+
+        // Shadow
+        d.draw_rectangle(x + 8, y + 8, w, h, Color::new(0, 0, 0, 100));
+
+        // Border & Header Colors
+        let border = if is_active { CYBER_THEME.border_active } else { CYBER_THEME.border_inactive };
+        let header = if is_active { CYBER_THEME.header_active } else { CYBER_THEME.header_inactive };
+
+        // Main Body
+        d.draw_rectangle(x, y, w, h, CYBER_THEME.win_bg);
+        d.draw_rectangle_lines(x, y, w, h, border);
+
+        // Header
+        d.draw_rectangle(x, y, w, 30, header);
+        d.draw_text(&win.title, x + 10, y + 8, 10, CYBER_THEME.text);
+
+        // Controls
+        d.draw_circle(x + w - 15, y + 15, 5.0, Color::RED);
+        d.draw_circle(x + w - 30, y + 15, 5.0, Color::YELLOW);
+
+        // Content Area Calculation
+        let content_rect = Rectangle::new(
+            win.rect.x + 10.0, 
+            win.rect.y + 40.0, 
+            win.rect.width - 20.0, 
+            win.rect.height - 50.0
+        );
+        
+        content(d, content_rect);
+    }
+
+    fn draw_sys_monitor(&self, d: &mut RaylibDrawHandle, hw: &VirtualHardware, r: Rectangle) {
+        let x = r.x as i32;
+        let y = r.y as i32;
+        let w = r.width as i32;
+        let h = r.height as i32;
+
+        d.draw_text("NEURAL CORES", x + 10, y + 5, 10, CYBER_THEME.text_dim);
+        for (i, load) in hw.cpu_load.iter().enumerate() {
+            let bar_w = (w - 40) as f32;
+            let fill = (*load * bar_w) as i32;
+            let by = y + 25 + (i as i32 * 25);
+            d.draw_rectangle(x + 20, by, bar_w as i32, 15, Color::new(10, 10, 15, 255));
+            let color = if *load > 0.8 { Color::RED } else if *load > 0.5 { Color::ORANGE } else { Color::GREEN };
+            d.draw_rectangle(x + 20, by, fill, 15, color);
+        }
+
+        d.draw_text("MEMORY MANIFOLD", x + 10, y + 140, 10, CYBER_THEME.text_dim);
+        let cell_size = 12;
+        let cols = 24;
+        let start_x = x + 20;
+        let start_y = y + 160;
+
+        for (i, block) in hw.ram.iter().enumerate() {
+            let bx = start_x + (i % cols) as i32 * (cell_size + 2);
+            let by = start_y + (i / cols) as i32 * (cell_size + 2);
+            if by > y + h - 20 { break; }
+            if bx > x + w - 20 { continue; }
+
+            let color = match block.block_type {
+                BlockType::Empty => Color::new(35, 35, 40, 255),
+                BlockType::User => Color::BLUE,
+                BlockType::System => Color::MAROON,
+                BlockType::Glitch => CYBER_THEME.glitch,
+            };
+            d.draw_rectangle(bx, by, cell_size, cell_size, color);
+            if block.heat > 0.1 {
+                let alpha = (block.heat * 200.0) as u8;
+                d.draw_rectangle(bx, by, cell_size, cell_size, Color::new(255, 255, 255, alpha));
+            }
+        }
+    }
+
+    fn draw_terminal(&self, d: &mut RaylibDrawHandle, hw: &VirtualHardware, r: Rectangle) {
+        let x = r.x as i32;
+        let y = r.y as i32;
+        let w = r.width as i32;
+        let h = r.height as i32;
+
+        d.draw_rectangle(x, y, w, h, Color::new(5, 5, 10, 200));
+        d.draw_rectangle_lines(x, y, w, h, CYBER_THEME.text_dim);
+        d.draw_text("user@fugue-os:~$ ./init_sequence", x + 10, y + 10, 10, CYBER_THEME.accent);
+        d.draw_text("> Loading Fugue Kernel...", x + 10, y + 25, 10, CYBER_THEME.accent);
+        d.draw_text("_", x + 10, y + 40, 10, CYBER_THEME.accent);
+
+        let prompt = format!("user@fugue-os:~$ {}_", hw.shell_buffer);
+        d.draw_text(&prompt, x + 10, y + 45, 10, CYBER_THEME.text);
+    }
+
+    fn draw_file_universe(&self, d: &mut RaylibDrawHandle, hw: &VirtualHardware, r: Rectangle) {
+        let x = r.x as i32;
+        let y = r.y as i32;
+        let w = r.width as i32;
+        let h = r.height as i32;
+
+        d.draw_rectangle(x, y, w, h, Color::BLACK);
+
+        let win_center_x = r.x + (r.width / 2.0);
+        let win_center_y = r.y + (r.height / 2.0);
+        let offset_x = win_center_x - 400.0;
+        let offset_y = win_center_y - 300.0;
+
+        let time = d.get_time();
+        let pulse = (time * 3.0).sin(); // -1 to 1
+        let alpha = ((pulse * 100.0) + 200.0) as u8; // 100 to 300
+        let edge_color = Color::new(100, 0, 200, alpha);
+
+        let to_window = |gx: f32, gy: f32| -> Vector2 {
+            Vector2::new(gx + offset_x, gy + offset_y)
+        };
+
+        {
+            let mut s = d.begin_scissor_mode(x + 2, y + 2, w - 4, h - 4);
+
+            // Edges
+            for node in &hw.files {
+                for &conn_id in &node.connections {
+                    if let Some(target) = hw.files.iter().find(|n| n.id == conn_id) {
+                        let start = to_window(node.x, node.y);
+                        let end = to_window(target.x, target.y);
+                        s.draw_line_v(start, end, edge_color);
+                    }
+                }
+            }
+
+            // Nodes
+            for node in &hw.files {
+                let pos = to_window(node.x, node.y);
+                let is_selected = Some(node.id) == hw.selected_file_id;
+                
+                let color = if is_selected { CYBER_THEME.accent } else { Color::PURPLE };
+                let radius = if is_selected { 6.0 } else { 4.0 };
+
+                s.draw_circle_v(pos, radius, color);
+                
+                // Draw ID if selected
+                if is_selected {
+                    s.draw_circle_lines(pos.x as i32, pos.y as i32, radius + 4.0, CYBER_THEME.accent);
+                }
+                
+                s.draw_text(&node.name, pos.x as i32 + 8, pos.y as i32 - 5, 10, CYBER_THEME.text_dim);
+            }
+        } 
+
+        d.draw_rectangle_lines(x, y, w, h, CYBER_THEME.accent);
+
+        // --- 2. FILE INTERACTION: PROPERTIES PANEL ---
+        if let Some(sel_id) = hw.selected_file_id {
+            if let Some(node) = hw.files.iter().find(|n| n.id == sel_id) {
+                let panel_x = x + w - 160;
+                let panel_y = y + 10;
+                d.draw_rectangle(panel_x, panel_y, 150, 100, Color::new(20, 20, 30, 240));
+                d.draw_rectangle_lines(panel_x, panel_y, 150, 100, CYBER_THEME.accent);
+                
+                d.draw_text("NODE PROPERTIES", panel_x + 5, panel_y + 5, 10, CYBER_THEME.accent);
+                d.draw_text(&format!("ID: {:04X}", node.id), panel_x + 5, panel_y + 25, 10, Color::WHITE);
+                d.draw_text(&format!("LINKS: {}", node.connections.len()), panel_x + 5, panel_y + 40, 10, Color::WHITE);
+                d.draw_text("STATUS: ACTIVE", panel_x + 5, panel_y + 55, 10, Color::GREEN);
+            }
+        }
+    }
+
+    fn draw_taskbar(&self, d: &mut RaylibDrawHandle, hw: &VirtualHardware, sw: i32, sh: i32) {
+        let bar_h = 40;
+        d.draw_rectangle(0, sh - bar_h, sw, bar_h, Color::new(20, 20, 25, 230));
+        d.draw_line(0, sh - bar_h, sw, sh - bar_h, CYBER_THEME.border_inactive);
+        d.draw_text("START", 10, sh - 28, 20, CYBER_THEME.text);
+        d.draw_text("|  [F1] Monitor  [F2] Terminal  [F3] Files", 90, sh - 28, 20, CYBER_THEME.text_dim);
+
+        let (status_text, status_color) = match hw.current_mindset {
+            KernelMindset::Idle => ("IDLE", CYBER_THEME.text_dim),
+            KernelMindset::OptimizingRAM => ("OPTIMIZING RAM", Color::BLUE),
+            KernelMindset::Rescheduling => ("RESCHEDULING", Color::RED),
+            KernelMindset::Thinking => ("PREDICTING INPUT", CYBER_THEME.accent),
+        };
+        let display_text = format!("KERNEL: {}", status_text);
+        let font_size = 20;
+        let text_width = d.measure_text(&display_text, font_size);
+        
+        // sw - text_width - margin (15px) ensures it stays on screen
+        // sh - 30 centers it better within the 40px taskbar
+        d.draw_text(&display_text, sw - text_width - 15, sh - 30, font_size, status_color);
+    }
+}
+
+
+
+================================================
+FILE: src/hardware.rs
+================================================
+use rand::Rng;
+use ort::session::Session;
+use ort::value::Value;
+use ndarray::Array2;
+
+pub const RAM_SIZE: usize = 256;
+pub const CPU_CORES: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StateIndex {
+    ActiveProcs,
+    CpuPressure,
+    WaitTime,
+    RamUsage,
+    FragScore,
+    MouseVel,
+    InputLatency,
+    StateSize
+}
+pub const STATE_VECTOR_SIZE: usize = StateIndex::StateSize as usize; 
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BlockType {
+    Empty,
+    System,
+    User,
+    Glitch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KernelMindset {
+    Idle,
+    OptimizingRAM,   // GAN
+    Rescheduling,    // RL
+    Thinking,        // LLM
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MemoryBlock {
+    pub id: usize,
+    pub block_type: BlockType,
+    pub heat: f32,
+    pub owner_pid: Option<u32>
+}
+
+#[derive(Clone, Debug)]
+pub struct FileNode {
+    pub id: u32,
+    pub name: String,
+    pub x: f32, 
+    pub y: f32,
+    pub vx: f32,
+    pub vy: f32,
+    pub connections: Vec<u32>
+}
+
+#[derive(Clone, Debug)]
+pub struct Process {
+    pub id: u32,
+    pub name: String,
+    pub cpu_impact: f32,
+    pub ram_impact: usize,
+    pub lifespan: u32,
+    pub current_wait: f32 
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SystemState {
+    pub active_processes: f32,
+    pub cpu_pressure: f32,
+    pub avg_wait_time: f32,
+    pub ram_usage: f32,
+    pub fragmentation_score: f32,
+    pub mouse_velocity: f32,
+    pub time_since_last_input: f32,
+}
+
+impl SystemState {
+    pub fn new() -> Self {
+        Self {
+            active_processes: 0.0,
+            cpu_pressure: 0.0,
+            avg_wait_time: 0.0,
+            ram_usage: 0.0,
+            fragmentation_score: 0.0,
+            mouse_velocity: 0.0,
+            time_since_last_input: 0.0,
+        }
+    }
+
+    pub fn to_state_vector(&self) -> Vec<f32> {
+        let mut vec = vec![0.0; STATE_VECTOR_SIZE];
+        vec[StateIndex::ActiveProcs as usize] = self.active_processes;
+        vec[StateIndex::CpuPressure as usize] = self.cpu_pressure.clamp(0.0, 1.0);
+        vec[StateIndex::WaitTime as usize] = self.avg_wait_time.min(1.0);
+        vec[StateIndex::RamUsage as usize] = self.ram_usage.clamp(0.0, 1.0);
+        vec[StateIndex::FragScore as usize] = self.fragmentation_score.clamp(0.0, 1.0);
+        vec[StateIndex::MouseVel as usize] = (self.mouse_velocity / 100.0).min(1.0);
+        vec[StateIndex::InputLatency as usize] = (self.time_since_last_input / 10.0).min(1.0);
+        vec
+    }
+}
+
+pub struct VirtualHardware {
+    pub ram: [MemoryBlock; RAM_SIZE],
+    pub cpu_load: [f32; CPU_CORES],
+    pub processes: Vec<Process>,
+    pub files: Vec<FileNode>,
+    pub selected_file_id: Option<u32>,
+    pub current_mindset: KernelMindset,
+    pub system_state: SystemState,
+    pub tick: u64,
+    pub shell_buffer: String,
+    pub model_session: Option<Session>,
+    process_counter: u32,
+}
+
+impl VirtualHardware {
+    pub fn load_brain(&mut self) {
+        // Load the ONNX file
+        let session = Session::builder()
+            .unwrap()
+            .commit_from_file("kernel_brain.onnx")
+            .unwrap();
+        self.model_session = Some(session);
+        println!("BRAIN LOADED: Neural Orchestrator Online.");
+    }
+
+    pub fn new() -> Self {
+        let empty_block = MemoryBlock { id: 0, block_type: BlockType::Empty, heat: 0.0, owner_pid: None };
+        
+        let mut files = Vec::new();
+        let mut rng = rand::rng();
+        for i in 0..15 {
+            files.push(FileNode {
+                id: i,
+                name: format!("node_{:02X}", i),
+                x: rng.random_range(200.0..600.0),
+                y: rng.random_range(200.0..400.0),
+                vx: 0.0, vy: 0.0,
+                connections: if i > 0 { vec![rng.random_range(0..i)] } else { vec![] },
+            });
+        }
+
+        Self {
+            ram: [empty_block; RAM_SIZE],
+            cpu_load: [0.0; CPU_CORES],
+            processes: Vec::new(),
+            files,
+            selected_file_id: None,
+            current_mindset: KernelMindset::Idle,
+            system_state: SystemState::new(),
+            tick: 0,
+            shell_buffer: String::new(),
+            model_session: None,
+            process_counter: 0,
+        }
+    }
+
+    pub fn update_mindset(&mut self) {
+        if let Some(session) = &mut self.model_session {
+            let state_vec = self.system_state.to_state_vector();
+            let input_array = Array2::from_shape_vec((1, 7), state_vec).unwrap();
+
+            // Explicitly create the tensor value
+            let input_tensor = Value::from_array(input_array).unwrap();
+            
+            // Pass the tensor to the macro
+            let outputs = session.run(ort::inputs!["float_input" => input_tensor]).unwrap();
+
+            let output_tensor = outputs["output_label"].try_extract_tensor::<i64>().unwrap();
+            let predicted_id = output_tensor.1[0];
+
+            self.current_mindset = match predicted_id {
+                0 => KernelMindset::Idle,
+                1 => KernelMindset::OptimizingRAM,
+                2 => KernelMindset::Thinking,
+                3 => KernelMindset::Rescheduling,
+                _ => KernelMindset::Idle,
+            };
+        }
+    }
+
+    pub fn update_sensors(&mut self) {
+        let occupied_blocks = self.ram.iter().filter(|b| b.block_type != BlockType::Empty).count();
+        self.system_state.ram_usage = occupied_blocks as f32 / RAM_SIZE as f32;
+
+        let total_load: f32 = self.cpu_load.iter().sum();
+        self.system_state.cpu_pressure = total_load / CPU_CORES as f32;
+        self.system_state.active_processes = self.processes.len() as f32;
+
+        if !self.processes.is_empty() {
+            let total_wait: f32 = self.processes.iter().map(|p| p.current_wait).sum();
+            self.system_state.avg_wait_time = total_wait / self.processes.len() as f32;
+        } else {
+            self.system_state.avg_wait_time = 0.0;
+        }
+
+        let mut switches = 0;
+        for i in 0..RAM_SIZE-1 {
+            if (self.ram[i].block_type == BlockType::Empty) != (self.ram[i+1].block_type == BlockType::Empty) {
+                switches += 1;
+            }
+        }
+        self.system_state.fragmentation_score = switches as f32 / RAM_SIZE as f32;
+    }
+
+    fn update_file_system(&mut self) {
+        let len = self.files.len();
+        for i in 0..len {
+            for j in 0..len {
+                if i == j { continue; }
+                let dx = self.files[i].x - self.files[j].x;
+                let dy = self.files[i].y - self.files[j].y;
+                let dist_sq = dx*dx + dy*dy;
+                if dist_sq > 0.1 && dist_sq < 10000.0 {
+                    let force = 40.0 / dist_sq;
+                    self.files[i].vx += dx * force;
+                    self.files[i].vy += dy * force;
+                }
+            }
+        }
+        for node in self.files.iter_mut() {
+            let dx = 400.0 - node.x; 
+            let dy = 300.0 - node.y; 
+            node.vx += dx * 0.005;
+            node.vy += dy * 0.005;
+            node.x += node.vx;
+            node.y += node.vy;
+            node.vx *= 0.90;
+            node.vy *= 0.90;
+        }
+    }
+
+    pub fn update_physics(&mut self) {
+        let mut rng = rand::rng();
+        self.tick += 1;
+        self.update_mindset();
+        self.update_file_system();
+        self.processes.retain(|p| p.lifespan > 0);
+        for p in self.processes.iter_mut() {
+            if p.lifespan < u32::MAX { p.lifespan -= 1; }
+        }
+        let total_demand: f32 = self.processes.iter().map(|p| p.cpu_impact).sum();
+        let total_capacity = CPU_CORES as f32 * 0.8;
+        if total_demand > total_capacity {
+            let starvation_factor = (total_demand - total_capacity) / self.processes.len() as f32;
+            for p in self.processes.iter_mut() {
+                p.current_wait += starvation_factor * rng.random_range(0.5..1.5);
+            }
+        } else {
+            for p in self.processes.iter_mut() {
+                p.current_wait = (p.current_wait - 0.1).max(0.0);
+            }
+        }
+        let target_per_core = (total_demand / CPU_CORES as f32).clamp(0.0, 1.0);
+        for i in 0..CPU_CORES {
+            let variance = rng.random_range(-0.02..0.02);
+            let target = (target_per_core + variance).clamp(0.0, 1.0);
+            self.cpu_load[i] += (target - self.cpu_load[i]) * 0.1;
+        }
+        for block in self.ram.iter_mut() { block.heat *= 0.98; }
+        self.update_sensors();
+    }
+
+    pub fn spawn_process(&mut self, name: &str, cpu: f32, ram: usize, persistent: bool) -> u32 {
+        self.process_counter += 1;
+        let pid = self.process_counter;
+        let lifespan = if persistent { u32::MAX } else { 600 };
+        let mut allocated = 0;
+        let mut rng = rand::rng();
+        for _ in 0..200 { 
+            if allocated >= ram { break; }
+            let idx = rng.random_range(0..RAM_SIZE);
+            if self.ram[idx].block_type == BlockType::Empty {
+                self.ram[idx].block_type = BlockType::User;
+                self.ram[idx].heat = 1.0;
+                self.ram[idx].owner_pid = Some(pid);
+                allocated += 1;
+            }
+        }
+        self.processes.push(Process {
+            id: pid, name: name.to_string(), cpu_impact: cpu, ram_impact: ram, lifespan, current_wait: 0.0
+        });
+        pid
+    }
+
+    pub fn kill_process(&mut self, pid: u32) {
+        self.processes.retain(|p| p.id != pid);
+        for block in self.ram.iter_mut() {
+            if block.owner_pid == Some(pid) {
+                block.block_type = BlockType::Empty;
+                block.owner_pid = None;
+            }
+        }
+    }
+}
+
+
+
+================================================
+FILE: src/main.rs
+================================================
+mod hardware;
+mod desktop;
+mod boot;
+
+use hardware::VirtualHardware;
+use desktop::{DesktopEnv, AppType};
+use raylib::prelude::*;
+use boot::BootSequence;
+use std::io::Write;
+use std::fs::OpenOptions;
+
+enum AppState {
+    Booting,
+    Running
+}
+
+fn main() {
+    let (mut rl, thread) = raylib::init()
+        .size(1280, 800)
+        .title("FUGUE OS")
+        .resizable()
+        .vsync()
+        .build();
+
+    let mut os_hw = VirtualHardware::new();
+    // Initialize AI
+    os_hw.load_brain();
+
+    let mut desktop = DesktopEnv::new();
+    let mut boot_seq = BootSequence::new();
+
+    if let Ok(tex) = rl.load_texture(&thread, "wallpapers/Cyberpunk_Street.png") {
+        desktop.wallpaper = Some(tex);
+    } else {
+        eprintln!("Failed to load wallpaper: wallpapers/Italian_Riveria.png");
+    }
+
+
+    // Start in booting mode
+    let mut current_state = AppState::Booting;
+
+    // Training Mode State
+    let mut is_training = false;
+    let mut training_timer = 0;
+
+    while !rl.window_should_close() {
+        match current_state {
+            AppState::Booting => {
+                boot_seq.update(rl.get_frame_time());
+                if boot_seq.is_finished {
+                    current_state = AppState::Running;
+                    // Open the default app ONLY when boot finishes
+                    desktop.open_window(&mut os_hw, AppType::SysMonitor);
+                }
+                let mut d = rl.begin_drawing(&thread);
+                boot_seq.draw(&mut d);
+            }
+
+            AppState::Running => {
+                while let Some(key) = rl.get_char_pressed() {
+                    let k = key as u32;
+                    // ASCII printable
+                    if k >= 32 && k <= 125 {
+                        os_hw.shell_buffer.push(key as char);
+                    }
+                }
+
+                if rl.is_key_pressed(KeyboardKey::KEY_BACKSPACE) {
+                    os_hw.shell_buffer.pop();
+                }
+
+                // Input Tracking
+                let mouse_delta = rl.get_mouse_delta();
+                let velocity = (mouse_delta.x.powi(2) + mouse_delta.y.powi(2)).sqrt();
+                os_hw.system_state.mouse_velocity = velocity;
+
+                if velocity > 0.1 || rl.get_key_pressed().is_some() || rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+                    os_hw.system_state.time_since_last_input = 0.0;
+                } else {
+                    os_hw.system_state.time_since_last_input += rl.get_frame_time();
+                }
+
+                // Update
+                os_hw.update_physics();
+                desktop.update(&rl, &mut os_hw);
+
+                // Shortcuts
+                if rl.is_key_pressed(KeyboardKey::KEY_F1) { desktop.open_window(&mut os_hw, AppType::SysMonitor); }
+                if rl.is_key_pressed(KeyboardKey::KEY_F2) { desktop.open_window(&mut os_hw, AppType::Terminal); }
+                if rl.is_key_pressed(KeyboardKey::KEY_F3) { desktop.open_window(&mut os_hw, AppType::FileUniverse); } // NEW
+                if rl.is_key_pressed(KeyboardKey::KEY_F4) { 
+                    // Close all
+                    while !desktop.windows.is_empty() { desktop.close_window(&mut os_hw, 0); }
+                }
+                if rl.is_key_pressed(KeyboardKey::KEY_F5) {
+                    is_training = !is_training;
+                    println!("TRAINING MODE: {}", is_training);
+                }
+
+                if is_training {
+                    training_timer += 1;
+                    if training_timer > 30 { // Log every 30 ticks (approx 0.5s)
+                        training_timer = 0;
+                        let state_vec = os_hw.system_state.to_state_vector();
+                        let csv_line = state_vec.iter().map(|x| x.to_string()).collect::<Vec<String>>().join(",");
+                        
+                        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("training_data.csv") {
+                            let _ = writeln!(file, "{}", csv_line);
+                        }
+                    }
+                }
+
+                // Draw
+                let mut d = rl.begin_drawing(&thread);
+                desktop.draw(&mut d, &os_hw);
+                
+                if is_training {
+                    d.draw_text("REC", 1200, 10, 20, Color::RED);
+                }
+            }
+        }
+    }
+}
+
+
