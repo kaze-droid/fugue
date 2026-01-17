@@ -1,6 +1,7 @@
 mod hardware;
 mod desktop;
 mod boot;
+mod theme_engine;
 
 use hardware::VirtualHardware;
 use desktop::{DesktopEnv, AppType};
@@ -19,8 +20,7 @@ fn main() {
         .size(1280, 800)
         .title("FUGUE OS")
         .resizable()
-        .vsync()
-        .build();
+        .build();  // Removed vsync for manual FPS control
 
     let mut os_hw = VirtualHardware::new();
     // Initialize AI
@@ -43,6 +43,9 @@ fn main() {
     let mut is_training = false;
     let mut training_timer = 0;
 
+    // RL Scheduler Toggle
+    let mut rl_scheduler_enabled = false;  // Default OFF
+
     while !rl.window_should_close() {
         match current_state {
             AppState::Booting => {
@@ -57,6 +60,11 @@ fn main() {
             }
 
             AppState::Running => {
+                // Check if terminal window is open
+                let terminal_open = desktop.windows.iter().any(|w| w.app_type == AppType::Terminal && w.is_open);
+                
+                // Only capture input if terminal is open
+                if terminal_open {
                 while let Some(key) = rl.get_char_pressed() {
                     let k = key as u32;
                     // ASCII printable
@@ -67,6 +75,52 @@ fn main() {
 
                 if rl.is_key_pressed(KeyboardKey::KEY_BACKSPACE) {
                     os_hw.shell_buffer.pop();
+                    }
+                }
+
+                // Handle Enter key for theme commands (only if terminal is open)
+                if rl.is_key_pressed(KeyboardKey::KEY_ENTER) && terminal_open {
+                    let command = os_hw.shell_buffer.trim().to_string();
+                    println!("[DEBUG] Enter pressed. Command: '{}'", command);
+                    println!("[DEBUG] Theme engine available: {}", os_hw.theme_engine.is_some());
+                    
+                    // Check if it's a theme command
+                    if command.starts_with("theme ") || command.starts_with("wallpaper ") {
+                        println!("[DEBUG] Theme command detected");
+                        let prompt = if command.starts_with("theme ") {
+                            command.strip_prefix("theme ").unwrap_or("")
+                        } else {
+                            command.strip_prefix("wallpaper ").unwrap_or("")
+                        };
+                        
+                        if !prompt.is_empty() {
+                            println!("[DEBUG] Prompt: '{}'", prompt);
+                            // Find matching wallpaper
+                            if let Some(theme_engine) = &mut os_hw.theme_engine {
+                                match theme_engine.find_wallpaper(prompt) {
+                                    Ok((wallpaper_name, similarity)) => {
+                                        println!("→ Loading '{}' (similarity: {:.2})", wallpaper_name, similarity);
+                                        
+                                        // Load the wallpaper
+                                        let wallpaper_path = format!("wallpapers/{}.png", wallpaper_name);
+                                        if let Ok(tex) = rl.load_texture(&thread, &wallpaper_path) {
+                                            desktop.wallpaper = Some(tex);
+                                        } else {
+                                            eprintln!("Failed to load wallpaper: {}", wallpaper_path);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[ERROR] Theme engine error: {}", e);
+                                    }
+                                }
+                            } else {
+                                eprintln!("[ERROR] Theme engine not initialized!");
+                            }
+                        }
+                    }
+                    
+                    // Clear shell buffer after command
+                    os_hw.shell_buffer.clear();
                 }
 
                 // Input Tracking
@@ -81,12 +135,23 @@ fn main() {
                 }
 
                 // Update
+                os_hw.rl_scheduler_enabled = rl_scheduler_enabled;
                 os_hw.update_physics();
                 desktop.update(&rl, &mut os_hw);
 
+                // Manual FPS limiting based on CPU pressure
+                rl.set_target_fps(os_hw.target_fps);
+
                 // Shortcuts
                 if rl.is_key_pressed(KeyboardKey::KEY_F1) { desktop.open_window(&mut os_hw, AppType::SysMonitor); }
-                if rl.is_key_pressed(KeyboardKey::KEY_F2) { desktop.open_window(&mut os_hw, AppType::Terminal); }
+                if rl.is_key_pressed(KeyboardKey::KEY_F2) { 
+                    desktop.open_window(&mut os_hw, AppType::Terminal);
+                    // Auto-spawn stress test if kernel is rescheduling
+                    if os_hw.current_mindset == hardware::KernelMindset::Rescheduling {
+                        os_hw.spawn_stress_test();
+                        println!("STRESS TEST AUTO-SPAWNED (Kernel Rescheduling)");
+                    }
+                }
                 if rl.is_key_pressed(KeyboardKey::KEY_F3) { desktop.open_window(&mut os_hw, AppType::FileUniverse); } // NEW
                 if rl.is_key_pressed(KeyboardKey::KEY_F4) { 
                     // Close all
@@ -95,6 +160,10 @@ fn main() {
                 if rl.is_key_pressed(KeyboardKey::KEY_F5) {
                     is_training = !is_training;
                     println!("TRAINING MODE: {}", is_training);
+                }
+                if rl.is_key_pressed(KeyboardKey::KEY_F6) {
+                    rl_scheduler_enabled = !rl_scheduler_enabled;
+                    println!("RL SCHEDULER: {}", if rl_scheduler_enabled { "ENABLED" } else { "DISABLED" });
                 }
 
                 if is_training {
