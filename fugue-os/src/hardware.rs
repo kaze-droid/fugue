@@ -2,6 +2,7 @@ use rand::Rng;
 use ort::session::Session;
 use ort::value::Value;
 use ndarray::Array2;
+use crate::graph_fs::GraphFileSystem;
 
 pub const RAM_SIZE: usize = 256;
 pub const CPU_CORES: usize = 4;
@@ -43,16 +44,8 @@ pub struct MemoryBlock {
     pub owner_pid: Option<u32>
 }
 
-#[derive(Clone, Debug)]
-pub struct FileNode {
-    pub id: u32,
-    pub name: String,
-    pub x: f32, 
-    pub y: f32,
-    pub vx: f32,
-    pub vy: f32,
-    pub connections: Vec<u32>
-}
+// FileNode is now part of GraphFileSystem (graph_fs::graph::GraphNode)
+// Keep a simple wrapper for compatibility if needed
 
 #[derive(Clone, Debug)]
 pub struct Process {
@@ -111,7 +104,7 @@ pub struct VirtualHardware {
     pub ram: [MemoryBlock; RAM_SIZE],
     pub cpu_load: [f32; CPU_CORES],
     pub processes: Vec<Process>,
-    pub files: Vec<FileNode>,
+    pub file_system: GraphFileSystem,
     pub selected_file_id: Option<u32>,
     pub current_mindset: KernelMindset,
     pub system_state: SystemState,
@@ -125,24 +118,31 @@ pub struct VirtualHardware {
 impl VirtualHardware {
     pub fn new() -> Self {
         let empty_block = MemoryBlock { id: 0, block_type: BlockType::Empty, heat: 0.0, owner_pid: None };
-        let mut rng = rand::rng();
-        let mut files = Vec::new();
-        for i in 0..15 {
-            files.push(FileNode {
-                id: i,
-                name: format!("node_{:02X}", i),
-                x: rng.random_range(200.0..600.0),
-                y: rng.random_range(200.0..400.0),
-                vx: 0.0, vy: 0.0,
-                connections: if i > 0 { vec![rng.random_range(0..i)] } else { vec![] },
-            });
-        }
+        
+        // Try to load existing file system, or create new with sample files
+        let file_system = match GraphFileSystem::load_from_file("fugue_filesystem.dat") {
+            Ok(fs) => {
+                println!("Loaded file system from disk ({} files)", fs.node_count());
+                fs
+            }
+            Err(e) => {
+                println!("Creating new file system: {}", e);
+                let mut fs = GraphFileSystem::new();
+                for i in 0..15 {
+                    let name = format!("node_{:02X}.txt", i);
+                    let path = format!("/home/user/{}", name);
+                    let content = format!("Sample content for file {}", i);
+                    fs.create_file(name, path, content);
+                }
+                fs
+            }
+        };
 
         Self {
             ram: [empty_block; RAM_SIZE],
             cpu_load: [0.0; CPU_CORES],
             processes: Vec::new(),
-            files,
+            file_system,
             selected_file_id: None,
             current_mindset: KernelMindset::Idle,
             system_state: SystemState::new(),
@@ -152,6 +152,13 @@ impl VirtualHardware {
             vae_session: None,
             process_counter: 0,
         }
+    }
+    
+    /// Save the file system to disk
+    pub fn save_file_system(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.file_system.save_to_file("fugue_filesystem.dat")?;
+        println!("File system saved ({} files)", self.file_system.node_count());
+        Ok(())
     }
 
     pub fn load_brain(&mut self) {
@@ -231,26 +238,8 @@ impl VirtualHardware {
     }
 
     fn update_file_system(&mut self) {
-        let len = self.files.len();
-        for i in 0..len {
-            for j in 0..len {
-                if i == j { continue; }
-                let dx = self.files[i].x - self.files[j].x;
-                let dy = self.files[i].y - self.files[j].y;
-                let dist_sq = dx*dx + dy*dy;
-                if dist_sq > 0.1 && dist_sq < 10000.0 {
-                    let force = 40.0 / dist_sq;
-                    self.files[i].vx += dx * force;
-                    self.files[i].vy += dy * force;
-                }
-            }
-        }
-        for node in self.files.iter_mut() {
-            node.vx += (400.0 - node.x) * 0.005;
-            node.vy += (300.0 - node.y) * 0.005;
-            node.x += node.vx; node.y += node.vy;
-            node.vx *= 0.90; node.vy *= 0.90;
-        }
+        // Use GraphFileSystem's built-in physics update
+        self.file_system.update_physics();
     }
 
     pub fn update_physics(&mut self) {

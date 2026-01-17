@@ -60,6 +60,18 @@ pub struct DesktopEnv {
     drag_ctx: Option<DragContext>,
     mouse_history: VecDeque<MouseSnapshot>,
     pub wallpaper: Option<Texture2D>,
+    pub input_mode: InputMode,
+    pub input_buffer: String,
+    pub multiline_buffer: Vec<String>, // For multiline editing
+    pub cursor_line: usize,
+}
+
+#[derive(Clone, PartialEq)]
+pub enum InputMode {
+    Normal,
+    CreatingFile,
+    ImportingFile,
+    EditingFile(u32), // Stores the file ID being edited
 }
 
 impl DesktopEnv {
@@ -69,6 +81,10 @@ impl DesktopEnv {
             drag_ctx: None,
             mouse_history: VecDeque::new(),
             wallpaper: None,
+            input_mode: InputMode::Normal,
+            input_buffer: String::new(),
+            multiline_buffer: vec![String::new()],
+            cursor_line: 0,
         }
     }
 
@@ -102,7 +118,7 @@ impl DesktopEnv {
 
     pub fn update(&mut self, rl: &RaylibHandle, hw: &mut VirtualHardware) {
         let mouse_pos = rl.get_mouse_position();
-        let is_dragging = self.drag_ctx.is_some() || rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT);;
+        let is_dragging = self.drag_ctx.is_some() || rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT);
         let time = rl.get_time();
         let screen_w = rl.get_screen_width() as f32;
         let screen_h = rl.get_screen_height() as f32;
@@ -174,7 +190,7 @@ impl DesktopEnv {
                     let (inner_x, inner_y, inner_w, inner_h) = (win.rect.x + 10.0, win.rect.y + 40.0, win.rect.width - 20.0, win.rect.height - 50.0);
                     let offset = Vector2::new((inner_x + inner_w / 2.0) - 400.0, (inner_y + inner_h / 2.0) - 300.0);
 
-                    for node in &hw.files {
+                    for node in hw.file_system.get_all_nodes() {
                         let node_rect = Rectangle::new(node.x + offset.x - 10.0, node.y + offset.y - 10.0, 20.0, 20.0);
                         // If trajectory hits the node hitbox
                         if liang_barsky_intersect(mouse_pos, pred, node_rect) {
@@ -277,7 +293,7 @@ impl DesktopEnv {
         let offset_y = (inner_y + inner_h / 2.0) - 300.0;
 
         let mut clicked_node = None;
-        for node in &hw.files {
+        for node in hw.file_system.get_all_nodes() {
             let nx = node.x + offset_x;
             let ny = node.y + offset_y;
             let dx = mouse_pos.x - nx;
@@ -325,6 +341,78 @@ impl DesktopEnv {
             });
         }
         self.draw_taskbar(d, hw, sw, sh);
+        
+        // Draw input dialog if in creation/import mode
+        if self.input_mode != InputMode::Normal {
+            self.draw_input_dialog(d);
+        }
+    }
+    
+    fn draw_input_dialog(&self, d: &mut RaylibDrawHandle) {
+        let sw = d.get_screen_width() as f32;
+        let sh = d.get_screen_height() as f32;
+        
+        match &self.input_mode {
+            InputMode::EditingFile(_) => {
+                // Full screen editor
+                let editor_w = sw - 200.0;
+                let editor_h = sh - 200.0;
+                let editor_x = 100.0;
+                let editor_y = 100.0;
+                
+                d.draw_rectangle(editor_x as i32, editor_y as i32, editor_w as i32, editor_h as i32, Color::new(15, 15, 20, 250));
+                d.draw_rectangle_lines(editor_x as i32, editor_y as i32, editor_w as i32, editor_h as i32, CYBER_THEME.accent);
+                
+                d.draw_text("FILE EDITOR", editor_x as i32 + 10, editor_y as i32 + 10, 20, CYBER_THEME.accent);
+                d.draw_text("CTRL-S to save | CTRL-Q to cancel", editor_x as i32 + 10, editor_y as i32 + 35, 12, CYBER_THEME.text_dim);
+                
+                // Draw content area
+                let content_y = editor_y as i32 + 55;
+                let content_h = editor_h as i32 - 65;
+                d.draw_rectangle(editor_x as i32 + 10, content_y, editor_w as i32 - 20, content_h, Color::new(10, 10, 15, 255));
+                
+                // Draw lines of text
+                let mut y_offset = content_y + 5;
+                for (i, line) in self.multiline_buffer.iter().enumerate() {
+                    let line_color = if i == self.cursor_line { Color::WHITE } else { CYBER_THEME.text_dim };
+                    let display_line = if i == self.cursor_line {
+                        format!("{}_", line)
+                    } else {
+                        line.clone()
+                    };
+                    d.draw_text(&display_line, editor_x as i32 + 15, y_offset, 14, line_color);
+                    y_offset += 18;
+                    if y_offset > content_y + content_h - 20 { break; }
+                }
+            }
+            _ => {
+                // Small dialog for file creation/import
+                let dialog_w = 500.0;
+                let dialog_h = 150.0;
+                let dialog_x = (sw - dialog_w) / 2.0;
+                let dialog_y = (sh - dialog_h) / 2.0;
+                
+                d.draw_rectangle(dialog_x as i32, dialog_y as i32, dialog_w as i32, dialog_h as i32, Color::new(20, 20, 30, 250));
+                d.draw_rectangle_lines(dialog_x as i32, dialog_y as i32, dialog_w as i32, dialog_h as i32, CYBER_THEME.accent);
+                
+                let title = match self.input_mode {
+                    InputMode::CreatingFile => "CREATE NEW FILE",
+                    InputMode::ImportingFile => "IMPORT FILE PATH",
+                    _ => "",
+                };
+                
+                d.draw_text(title, dialog_x as i32 + 10, dialog_y as i32 + 10, 20, CYBER_THEME.accent);
+                d.draw_text("Enter filename (or path to import):", dialog_x as i32 + 10, dialog_y as i32 + 45, 15, Color::WHITE);
+                
+                // Draw input box
+                let input_box_y = dialog_y as i32 + 75;
+                d.draw_rectangle(dialog_x as i32 + 10, input_box_y, dialog_w as i32 - 20, 30, Color::new(10, 10, 15, 255));
+                d.draw_rectangle_lines(dialog_x as i32 + 10, input_box_y, dialog_w as i32 - 20, 30, CYBER_THEME.accent);
+                d.draw_text(&format!("{}_", self.input_buffer), dialog_x as i32 + 15, input_box_y + 8, 15, Color::WHITE);
+                
+                d.draw_text("Press ENTER to confirm, CTRL-Q to cancel", dialog_x as i32 + 10, dialog_y as i32 + 120, 12, CYBER_THEME.text_dim);
+            }
+        }
     }
 
     fn draw_window_frame<F>(&self, d: &mut RaylibDrawHandle, win: &Window, is_active: bool, content: F)
@@ -406,15 +494,18 @@ impl DesktopEnv {
         let edge_color = Color::new(100, 0, 200, ((d.get_time() * 3.0).sin() * 100.0 + 155.0) as u8);
         {
             let mut s = d.begin_scissor_mode(x + 2, y + 2, w - 4, h - 4);
-            for node in &hw.files {
-                for &conn_id in &node.connections {
-                    if let Some(t) = hw.files.iter().find(|n| n.id == conn_id) {
+            // Draw edges (connections)
+            for node in hw.file_system.get_all_nodes() {
+                let connections = hw.file_system.get_connections(node.id);
+                for conn_id in connections {
+                    if let Some(target) = hw.file_system.get_node(conn_id) {
                         s.draw_line_v(Vector2::new(node.x + offset.x, node.y + offset.y), 
-                                     Vector2::new(t.x + offset.x, t.y + offset.y), edge_color);
+                                     Vector2::new(target.x + offset.x, target.y + offset.y), edge_color);
                     }
                 }
             }
-            for node in &hw.files {
+            // Draw nodes
+            for node in hw.file_system.get_all_nodes() {
                 let pos = Vector2::new(node.x + offset.x, node.y + offset.y);
                 let sel = Some(node.id) == hw.selected_file_id;
                 s.draw_circle_v(pos, if sel { 6.0 } else { 4.0 }, if sel { CYBER_THEME.accent } else { Color::PURPLE });
@@ -423,13 +514,17 @@ impl DesktopEnv {
             }
         }
         d.draw_rectangle_lines(x, y, w, h, CYBER_THEME.accent);
-        if let Some(sel) = hw.selected_file_id.and_then(|id| hw.files.iter().find(|n| n.id == id)) {
+        // Draw node properties panel
+        if let Some(sel) = hw.selected_file_id.and_then(|id| hw.file_system.get_node(id)) {
             let px = x + w - 160;
-            d.draw_rectangle(px, y + 10, 150, 100, Color::new(20, 20, 30, 240));
-            d.draw_rectangle_lines(px, y + 10, 150, 100, CYBER_THEME.accent);
+            let connections = hw.file_system.get_connections(sel.id);
+            d.draw_rectangle(px, y + 10, 150, 120, Color::new(20, 20, 30, 240));
+            d.draw_rectangle_lines(px, y + 10, 150, 120, CYBER_THEME.accent);
             d.draw_text("NODE PROPERTIES", px + 5, y + 15, 10, CYBER_THEME.accent);
             d.draw_text(&format!("ID: {:04X}", sel.id), px + 5, y + 35, 10, Color::WHITE);
-            d.draw_text(&format!("LINKS: {}", sel.connections.len()), px + 5, y + 50, 10, Color::WHITE);
+            d.draw_text(&format!("LINKS: {}", connections.len()), px + 5, y + 50, 10, Color::WHITE);
+            d.draw_text(&format!("SIZE: {} B", sel.size), px + 5, y + 65, 10, Color::WHITE);
+            d.draw_text(&format!("TYPE: {}", sel.file_type), px + 5, y + 80, 10, Color::WHITE);
         }
     }
 
@@ -437,7 +532,7 @@ impl DesktopEnv {
         d.draw_rectangle(0, sh - 40, sw, 40, Color::new(20, 20, 25, 230));
         d.draw_line(0, sh - 40, sw, sh - 40, CYBER_THEME.border_inactive);
         d.draw_text("START", 10, sh - 28, 20, CYBER_THEME.text);
-        d.draw_text("|  [F1] Monitor  [F2] Terminal  [F3] Files", 90, sh - 28, 20, CYBER_THEME.text_dim);
+        d.draw_text("|  [F1] Monitor  [F2] Terminal  [F3] Files  [F6] Create  [F7] Import  [F8] Edit", 90, sh - 28, 20, CYBER_THEME.text_dim);
         let (txt, clr) = match hw.current_mindset {
             KernelMindset::Idle => ("IDLE", CYBER_THEME.text_dim),
             KernelMindset::OptimizingRAM => ("OPTIMIZING RAM", Color::BLUE),
