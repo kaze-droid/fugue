@@ -30,9 +30,9 @@ pub enum BlockType {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum KernelMindset {
     Idle,
-    OptimizingRAM,   // GAN
+    OptimizingRAM,   // GAN/VAE
     Rescheduling,    // RL
-    Thinking,        // LLM
+    Thinking,        // LLM/Intent
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -62,6 +62,12 @@ pub struct Process {
     pub ram_impact: usize,
     pub lifespan: u32,
     pub current_wait: f32 
+}
+
+// Data structure for ballistic trajectory tracking in desktop.rs
+pub struct MousePoint {
+    pub pos: raylib::prelude::Vector2,
+    pub time: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,24 +123,10 @@ pub struct VirtualHardware {
 }
 
 impl VirtualHardware {
-    pub fn load_brain(&mut self) {
-        // Load Orchestrator
-        self.model_session = Some(Session::builder()
-            .unwrap()
-            .commit_from_file("kernel_brain.onnx")
-            .unwrap());
-
-        self.vae_session = Some(Session::builder()
-            .unwrap()
-            .commit_from_file("memory_vae.onnx")
-            .unwrap());
-    }
-
     pub fn new() -> Self {
         let empty_block = MemoryBlock { id: 0, block_type: BlockType::Empty, heat: 0.0, owner_pid: None };
-        
-        let mut files = Vec::new();
         let mut rng = rand::rng();
+        let mut files = Vec::new();
         for i in 0..15 {
             files.push(FileNode {
                 id: i,
@@ -162,19 +154,21 @@ impl VirtualHardware {
         }
     }
 
+    pub fn load_brain(&mut self) {
+        self.model_session = Some(Session::builder().unwrap().commit_from_file("kernel_brain.onnx").unwrap());
+        self.vae_session = Some(Session::builder().unwrap().commit_from_file("memory_vae.onnx").unwrap());
+        println!("NEURAL ENGINES ONLINE.");
+    }
+
     pub fn update_mindset(&mut self) {
         if let Some(session) = &mut self.model_session {
             let state_vec = self.system_state.to_state_vector();
             let input_array = Array2::from_shape_vec((1, 7), state_vec).unwrap();
-
-            // Explicitly create the tensor value
             let input_tensor = Value::from_array(input_array).unwrap();
             
-            // Pass the tensor to the macro
             let outputs = session.run(ort::inputs!["float_input" => input_tensor]).unwrap();
-
             let output_tensor = outputs["output_label"].try_extract_tensor::<i64>().unwrap();
-            let predicted_id = output_tensor.1[0];
+            let predicted_id = *output_tensor.1.first().unwrap();
 
             self.current_mindset = match predicted_id {
                 0 => KernelMindset::Idle,
@@ -184,59 +178,47 @@ impl VirtualHardware {
                 _ => KernelMindset::Idle,
             };
         }
+
+        if self.current_mindset == KernelMindset::Thinking {
+            self.system_state.cpu_pressure = (self.system_state.cpu_pressure + 0.001).min(1.0);
+        }
     }
 
     pub fn neural_defrag(&mut self) {
         if let Some(session) = &mut self.vae_session {
-            // 1. Flatten RAM into 0.0, 0.5, 1.0 for the AI
-            let input_data: Vec<f32> = self.ram.iter().map(|b| {
-                match b.block_type {
-                    BlockType::Empty => 0.0,
-                    BlockType::User => 0.5,
-                    BlockType::System => 1.0,
-                    BlockType::Glitch => 0.5,
-                }
+            let input_data: Vec<f32> = self.ram.iter().map(|b| match b.block_type {
+                BlockType::Empty => 0.0,
+                BlockType::User => 0.5,
+                BlockType::System => 1.0,
+                _ => 0.0,
             }).collect();
 
             let input_array = Array2::from_shape_vec((1, 256), input_data).unwrap();
             let input_tensor = Value::from_array(input_array).unwrap();
-            
-            // 2. Run Inference
             let outputs = session.run(ort::inputs!["input" => input_tensor]).unwrap();
             let output_tensor = outputs["output"].try_extract_tensor::<f32>().unwrap();
-            let view = output_tensor.1; // Get the array view
+            let view = output_tensor.1;
 
-            // 3. Apply the "Neural Mask"
-            // We use the AI's probability output to re-assign block types
             for i in 0..RAM_SIZE {
                 let val = view[i];
                 let old_type = self.ram[i].block_type;
-
                 if val > 0.8 { self.ram[i].block_type = BlockType::System; }
                 else if val > 0.3 { self.ram[i].block_type = BlockType::User; }
                 else { self.ram[i].block_type = BlockType::Empty; }
-
-                // If the AI changed the block, make it "glow" in the UI
-                if old_type != self.ram[i].block_type {
-                    self.ram[i].heat = 1.0; 
-                }
+                if old_type != self.ram[i].block_type { self.ram[i].heat = 1.0; }
             }
         }
     }
 
     pub fn update_sensors(&mut self) {
-        let occupied_blocks = self.ram.iter().filter(|b| b.block_type != BlockType::Empty).count();
-        self.system_state.ram_usage = occupied_blocks as f32 / RAM_SIZE as f32;
-
-        let total_load: f32 = self.cpu_load.iter().sum();
-        self.system_state.cpu_pressure = total_load / CPU_CORES as f32;
+        let occupied = self.ram.iter().filter(|b| b.block_type != BlockType::Empty).count();
+        self.system_state.ram_usage = occupied as f32 / RAM_SIZE as f32;
+        self.system_state.cpu_pressure = self.cpu_load.iter().sum::<f32>() / CPU_CORES as f32;
         self.system_state.active_processes = self.processes.len() as f32;
 
         if !self.processes.is_empty() {
             let total_wait: f32 = self.processes.iter().map(|p| p.current_wait).sum();
             self.system_state.avg_wait_time = total_wait / self.processes.len() as f32;
-        } else {
-            self.system_state.avg_wait_time = 0.0;
         }
 
         let mut switches = 0;
@@ -264,14 +246,10 @@ impl VirtualHardware {
             }
         }
         for node in self.files.iter_mut() {
-            let dx = 400.0 - node.x; 
-            let dy = 300.0 - node.y; 
-            node.vx += dx * 0.005;
-            node.vy += dy * 0.005;
-            node.x += node.vx;
-            node.y += node.vy;
-            node.vx *= 0.90;
-            node.vy *= 0.90;
+            node.vx += (400.0 - node.x) * 0.005;
+            node.vy += (300.0 - node.y) * 0.005;
+            node.x += node.vx; node.y += node.vy;
+            node.vx *= 0.90; node.vy *= 0.90;
         }
     }
 
@@ -280,33 +258,26 @@ impl VirtualHardware {
         self.tick += 1;
         self.update_mindset();
 
-        // --- Trigger Neural Defrag ---
         if self.current_mindset == KernelMindset::OptimizingRAM && self.tick % 60 == 0 {
             self.neural_defrag();
         }
 
         self.update_file_system();
         self.processes.retain(|p| p.lifespan > 0);
-        for p in self.processes.iter_mut() {
-            if p.lifespan < u32::MAX { p.lifespan -= 1; }
-        }
+        for p in self.processes.iter_mut() { if p.lifespan < u32::MAX { p.lifespan -= 1; } }
+
         let total_demand: f32 = self.processes.iter().map(|p| p.cpu_impact).sum();
-        let total_capacity = CPU_CORES as f32 * 0.8;
-        if total_demand > total_capacity {
-            let starvation_factor = (total_demand - total_capacity) / self.processes.len() as f32;
-            for p in self.processes.iter_mut() {
-                p.current_wait += starvation_factor * rng.random_range(0.5..1.5);
-            }
+        let total_cap = CPU_CORES as f32 * 0.8;
+        if total_demand > total_cap {
+            let starve = (total_demand - total_cap) / self.processes.len() as f32;
+            for p in self.processes.iter_mut() { p.current_wait += starve * rng.random_range(0.5..1.5); }
         } else {
-            for p in self.processes.iter_mut() {
-                p.current_wait = (p.current_wait - 0.1).max(0.0);
-            }
+            for p in self.processes.iter_mut() { p.current_wait = (p.current_wait - 0.1).max(0.0); }
         }
-        let target_per_core = (total_demand / CPU_CORES as f32).clamp(0.0, 1.0);
+
+        let target = (total_demand / CPU_CORES as f32).clamp(0.0, 1.0);
         for i in 0..CPU_CORES {
-            let variance = rng.random_range(-0.02..0.02);
-            let target = (target_per_core + variance).clamp(0.0, 1.0);
-            self.cpu_load[i] += (target - self.cpu_load[i]) * 0.1;
+            self.cpu_load[i] += (target + rng.random_range(-0.02..0.02) - self.cpu_load[i]) * 0.1;
         }
         for block in self.ram.iter_mut() { block.heat *= 0.98; }
         self.update_sensors();
@@ -328,9 +299,7 @@ impl VirtualHardware {
                 allocated += 1;
             }
         }
-        self.processes.push(Process {
-            id: pid, name: name.to_string(), cpu_impact: cpu, ram_impact: ram, lifespan, current_wait: 0.0
-        });
+        self.processes.push(Process { id: pid, name: name.to_string(), cpu_impact: cpu, ram_impact: ram, lifespan, current_wait: 0.0 });
         pid
     }
 
