@@ -3,6 +3,9 @@ use ort::session::Session;
 use ort::value::Value;
 use ndarray::Array2;
 use crate::theme_engine::ThemeEngine;
+use crate::graph_fs::GraphFileSystem;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::collections::VecDeque;
 
 pub const RAM_SIZE: usize = 256;
 pub const CPU_CORES: usize = 4;
@@ -45,16 +48,7 @@ pub struct MemoryBlock {
     pub owner_pid: Option<u32>
 }
 
-#[derive(Clone, Debug)]
-pub struct FileNode {
-    pub id: u32,
-    pub name: String,
-    pub x: f32, 
-    pub y: f32,
-    pub vx: f32,
-    pub vy: f32,
-    pub connections: Vec<u32>
-}
+// FileNode is now part of GraphFileSystem (graph_fs::graph::GraphNode)
 
 #[derive(Clone, Debug)]
 pub struct Process {
@@ -112,7 +106,7 @@ pub struct VirtualHardware {
     pub ram: [MemoryBlock; RAM_SIZE],
     pub cpu_load: [f32; CPU_CORES],
     pub processes: Vec<Process>,
-    pub files: Vec<FileNode>,
+    pub file_system: GraphFileSystem,
     pub selected_file_id: Option<u32>,
     pub current_mindset: KernelMindset,
     pub system_state: SystemState,
@@ -127,6 +121,13 @@ pub struct VirtualHardware {
     pub rl_decision_flash: f32,  // Visual flash when RL makes a decision
     pub target_fps: u32,  // Target FPS for frame limiting
     pub cpu_pressure: f32,  // Overall CPU pressure (0.0 to 1.0)
+    // SLM Shell Integration (Ollama API)
+    pub stream_tx: Sender<String>,
+    pub stream_rx: Receiver<String>,
+    pub partial_response: String,
+    pub is_thinking: bool,
+    pub kernel_messages: VecDeque<String>,
+    pub ollama_available: bool,  // Track if Ollama is running
     process_counter: u32,
 }
 
@@ -169,29 +170,69 @@ impl VirtualHardware {
                 self.theme_engine = None;
             }
         }
+
+        // Check if Ollama is available
+        println!("[Hardware] Checking Ollama API availability...");
+        match ureq::get("http://localhost:11434/api/tags").call() {
+            Ok(_) => {
+                self.ollama_available = true;
+                println!("[Hardware] ✓ Ollama API is available");
+            }
+            Err(e) => {
+                self.ollama_available = false;
+                eprintln!("[Hardware] ✗ Ollama not available: {}", e);
+                eprintln!("[Hardware] Make sure Ollama is running: ollama serve");
+            }
+        }
     }
 
     pub fn new() -> Self {
         let empty_block = MemoryBlock { id: 0, block_type: BlockType::Empty, heat: 0.0, owner_pid: None };
         
-        let mut files = Vec::new();
-        let mut rng = rand::rng();
-        for i in 0..15 {
-            files.push(FileNode {
-                id: i,
-                name: format!("node_{:02X}", i),
-                x: rng.random_range(200.0..600.0),
-                y: rng.random_range(200.0..400.0),
-                vx: 0.0, vy: 0.0,
-                connections: if i > 0 { vec![rng.random_range(0..i)] } else { vec![] },
-            });
+        // Try to load existing file system, or create new with sample files
+        let mut file_system = match GraphFileSystem::load_from_file("fugue_filesystem.dat") {
+            Ok(fs) => {
+                println!("Loaded file system from disk ({} files)", fs.node_count());
+                fs
+            }
+            Err(e) => {
+                println!("Creating new file system: {}", e);
+                let mut fs = GraphFileSystem::new();
+                for i in 0..15 {
+                    let name = format!("node_{:02X}.txt", i);
+                    let path = format!("/home/user/{}", name);
+                    let content = format!("Sample content for file {}", i);
+                    fs.create_file(name, path, content);
+                }
+                fs
+            }
+        };
+        
+        // Initialize embedding service and generate embeddings at boot
+        println!("[Hardware] Initializing file embeddings...");
+        match file_system.init_embedding_service("text_embedding_model.onnx", "tokenizer.json") {
+            Ok(_) => {
+                println!("[Hardware] ✓ Embedding service initialized");
+                // Generate embeddings for all files at boot
+                match file_system.update_graph_with_embeddings() {
+                    Ok(_) => println!("[Hardware] ✓ File embeddings generated and graph updated"),
+                    Err(e) => eprintln!("[Hardware] ✗ Failed to generate embeddings: {}", e),
+                }
+            }
+            Err(e) => {
+                eprintln!("[Hardware] ✗ Failed to initialize embedding service: {}", e);
+                eprintln!("[Hardware] File system will work without semantic embeddings");
+            }
         }
+
+        // Create channels for SLM communication
+        let (stream_tx, stream_rx) = mpsc::channel();
 
         Self {
             ram: [empty_block; RAM_SIZE],
             cpu_load: [0.0; CPU_CORES],
             processes: Vec::new(),
-            files,
+            file_system,
             selected_file_id: None,
             current_mindset: KernelMindset::Idle,
             system_state: SystemState::new(),
@@ -206,8 +247,21 @@ impl VirtualHardware {
             rl_decision_flash: 0.0,
             target_fps: 60,
             cpu_pressure: 0.0,
+            stream_tx,
+            stream_rx,
+            partial_response: String::new(),
+            is_thinking: false,
+            kernel_messages: VecDeque::new(),
+            ollama_available: false,
             process_counter: 0,
         }
+    }
+    
+    /// Save the file system to disk
+    pub fn save_file_system(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.file_system.save_to_file("fugue_filesystem.dat")?;
+        println!("File system saved ({} files)", self.file_system.node_count());
+        Ok(())
     }
 
     fn get_scheduler_state(&self) -> Vec<f32> {
@@ -311,30 +365,8 @@ impl VirtualHardware {
     }
 
     fn update_file_system(&mut self) {
-        let len = self.files.len();
-        for i in 0..len {
-            for j in 0..len {
-                if i == j { continue; }
-                let dx = self.files[i].x - self.files[j].x;
-                let dy = self.files[i].y - self.files[j].y;
-                let dist_sq = dx*dx + dy*dy;
-                if dist_sq > 0.1 && dist_sq < 10000.0 {
-                    let force = 40.0 / dist_sq;
-                    self.files[i].vx += dx * force;
-                    self.files[i].vy += dy * force;
-                }
-            }
-        }
-        for node in self.files.iter_mut() {
-            let dx = 400.0 - node.x; 
-            let dy = 300.0 - node.y; 
-            node.vx += dx * 0.005;
-            node.vy += dy * 0.005;
-            node.x += node.vx;
-            node.y += node.vy;
-            node.vx *= 0.90;
-            node.vy *= 0.90;
-        }
+        // Use GraphFileSystem's built-in physics update
+        self.file_system.update_physics();
     }
 
     pub fn update_physics(&mut self) {
@@ -344,11 +376,11 @@ impl VirtualHardware {
         // Update mindset naturally
         self.update_mindset();
         
-        // Force Rescheduling mode when RL is enabled and under pressure
-        // This overrides the natural state only when RL is on
-        if self.rl_scheduler_enabled && self.cpu_pressure > 0.5 {
-            self.current_mindset = KernelMindset::Rescheduling;
-        }
+        // Automatically enable RL scheduler when in Rescheduling or OptimizingRAM mode
+        self.rl_scheduler_enabled = matches!(
+            self.current_mindset, 
+            KernelMindset::Rescheduling | KernelMindset::OptimizingRAM
+        );
 
         // --- Trigger Neural Defrag ---
         if self.current_mindset == KernelMindset::OptimizingRAM && self.tick % 60 == 0 {
@@ -365,9 +397,19 @@ impl VirtualHardware {
         let total_demand: f32 = self.processes.iter().map(|p| p.cpu_impact).sum();
         self.cpu_pressure = (total_demand / (CPU_CORES as f32 * 0.8)).clamp(0.0, 1.0);
         
-        // RL-based process scheduling
+        // FPS always based on cpu_pressure - high pressure = laggy system
+        if self.cpu_pressure > 0.7 {
+            self.target_fps = 15;
+        } else if self.cpu_pressure > 0.5 {
+            self.target_fps = 25;
+        } else if self.cpu_pressure > 0.3 {
+            self.target_fps = 40;
+        } else {
+            self.target_fps = 60;
+        }
+        
+        // RL-based process scheduling - reduces pressure over time
         if self.rl_scheduler_enabled 
-            && self.current_mindset == KernelMindset::Rescheduling 
             && !self.processes.is_empty() 
         {
             // Get state first before borrowing scheduler
@@ -408,11 +450,11 @@ impl VirtualHardware {
                             p.current_wait += 1.0;
                         }
                     }
+                    
+                    // RL actively reduces pressure by smart scheduling
+                    self.cpu_pressure = (self.cpu_pressure - 0.03).max(0.0);
                 }
             }
-            
-            // Set target FPS to 60 when RL is managing load
-            self.target_fps = 60;
             
             // Visual "cheat": Increase heat on stress test RAM blocks when under pressure
             if self.cpu_pressure > 0.7 {
@@ -428,27 +470,19 @@ impl VirtualHardware {
             // Clear RL scheduling indicators
             self.last_scheduled_process = None;
             
-            // Without RL: Stress tests cause frame drops
-            if self.cpu_pressure > 0.7 {
-                self.target_fps = 20;  // Dramatic slowdown
-            } else if self.cpu_pressure > 0.5 {
-                self.target_fps = 40;
+            // Fallback to simple scheduling when RL not active
+            let total_demand: f32 = self.processes.iter().map(|p| p.cpu_impact).sum();
+            let total_capacity = CPU_CORES as f32 * 0.8;
+            if total_demand > total_capacity {
+                let starvation_factor = (total_demand - total_capacity) / self.processes.len() as f32;
+                for p in self.processes.iter_mut() {
+                    p.current_wait += starvation_factor * rng.random_range(0.5..1.5);
+                }
             } else {
-                self.target_fps = 60;
+                for p in self.processes.iter_mut() {
+                    p.current_wait = (p.current_wait - 0.1).max(0.0);
+                }
             }
-            // Fallback to simple scheduling when not in Rescheduling mode
-        let total_demand: f32 = self.processes.iter().map(|p| p.cpu_impact).sum();
-        let total_capacity = CPU_CORES as f32 * 0.8;
-        if total_demand > total_capacity {
-            let starvation_factor = (total_demand - total_capacity) / self.processes.len() as f32;
-            for p in self.processes.iter_mut() {
-                p.current_wait += starvation_factor * rng.random_range(0.5..1.5);
-            }
-        } else {
-            for p in self.processes.iter_mut() {
-                p.current_wait = (p.current_wait - 0.1).max(0.0);
-            }
-        }
         }
         
         // CPU load distribution - different behavior based on RL mode
@@ -468,9 +502,9 @@ impl VirtualHardware {
         } else {
             // Simple mode: Standard target_per_core logic - less efficient
             let target_per_core = (self.cpu_pressure).clamp(0.0, 1.0);  // Uses full pressure
-        for i in 0..CPU_CORES {
-            let variance = rng.random_range(-0.02..0.02);
-            let target = (target_per_core + variance).clamp(0.0, 1.0);
+            for i in 0..CPU_CORES {
+                let variance = rng.random_range(-0.02..0.02);
+                let target = (target_per_core + variance).clamp(0.0, 1.0);
                 self.cpu_load[i] += (target - self.cpu_load[i]) * 0.08; // Slower, uniform
             }
         }
