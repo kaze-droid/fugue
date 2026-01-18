@@ -3,6 +3,9 @@ use ort::session::Session;
 use ort::value::Value;
 use ndarray::Array2;
 use crate::theme_engine::ThemeEngine;
+use crate::graph_fs::GraphFileSystem;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::collections::VecDeque;
 
 pub const RAM_SIZE: usize = 256;
 pub const CPU_CORES: usize = 4;
@@ -45,16 +48,7 @@ pub struct MemoryBlock {
     pub owner_pid: Option<u32>
 }
 
-#[derive(Clone, Debug)]
-pub struct FileNode {
-    pub id: u32,
-    pub name: String,
-    pub x: f32, 
-    pub y: f32,
-    pub vx: f32,
-    pub vy: f32,
-    pub connections: Vec<u32>
-}
+// FileNode is now part of GraphFileSystem (graph_fs::graph::GraphNode)
 
 #[derive(Clone, Debug)]
 pub struct Process {
@@ -112,21 +106,36 @@ pub struct VirtualHardware {
     pub ram: [MemoryBlock; RAM_SIZE],
     pub cpu_load: [f32; CPU_CORES],
     pub processes: Vec<Process>,
-    pub files: Vec<FileNode>,
+    pub file_system: GraphFileSystem,
     pub selected_file_id: Option<u32>,
     pub current_mindset: KernelMindset,
     pub system_state: SystemState,
     pub tick: u64,
     pub shell_buffer: String,
+    pub shell_cursor: usize,  // Cursor position in shell_buffer
+    pub backspace_held_frames: u32,  // Track how long backspace is held
     pub model_session: Option<Session>,
     pub vae_session: Option<Session>,
     pub theme_engine: Option<ThemeEngine>,
     pub scheduler_session: Option<Session>,
     pub rl_scheduler_enabled: bool,
+    pub vae_enabled: bool,           // VAE neural defrag
+    pub theme_enabled: bool,         // Theme engine
+    pub embeddings_enabled: bool,    // File embeddings
     pub last_scheduled_process: Option<usize>,  // Track which process was scheduled
     pub rl_decision_flash: f32,  // Visual flash when RL makes a decision
     pub target_fps: u32,  // Target FPS for frame limiting
     pub cpu_pressure: f32,  // Overall CPU pressure (0.0 to 1.0)
+    // SLM Shell Integration (OpenAI API)
+    pub stream_tx: Sender<String>,
+    pub stream_rx: Receiver<String>,
+    pub intent_tx: Sender<crate::slm::ShellIntent>,
+    pub intent_rx: Receiver<crate::slm::ShellIntent>,
+    pub partial_response: String,
+    pub is_thinking: bool,
+    pub kernel_messages: VecDeque<String>,
+    pub openai_available: bool,  // Track if OpenAI API key is set
+    pub openai_api_key: Option<String>,  // OpenAI API key from .env
     process_counter: u32,
 }
 
@@ -169,45 +178,116 @@ impl VirtualHardware {
                 self.theme_engine = None;
             }
         }
+
+        // Load OpenAI API key from .env
+        println!("[Hardware] Loading OpenAI API key...");
+        let _ = dotenvy::dotenv(); // Try to load .env file (ignore if missing)
+        match std::env::var("OPENAI_API_KEY") {
+            Ok(key) if !key.is_empty() => {
+                self.openai_api_key = Some(key);
+                self.openai_available = true;
+                println!("[Hardware] ✓ OpenAI API key loaded");
+            }
+            _ => {
+                self.openai_available = false;
+                self.openai_api_key = None;
+                eprintln!("[Hardware] ✗ OPENAI_API_KEY not found in .env");
+                eprintln!("[Hardware] Create a .env file with: OPENAI_API_KEY=sk-...");
+            }
+        }
     }
 
     pub fn new() -> Self {
         let empty_block = MemoryBlock { id: 0, block_type: BlockType::Empty, heat: 0.0, owner_pid: None };
         
-        let mut files = Vec::new();
-        let mut rng = rand::rng();
-        for i in 0..15 {
-            files.push(FileNode {
-                id: i,
-                name: format!("node_{:02X}", i),
-                x: rng.random_range(200.0..600.0),
-                y: rng.random_range(200.0..400.0),
-                vx: 0.0, vy: 0.0,
-                connections: if i > 0 { vec![rng.random_range(0..i)] } else { vec![] },
-            });
+        // Try to load existing file system, or create new with sample files
+        let mut file_system = match GraphFileSystem::load_from_file("fugue_filesystem.dat") {
+            Ok(fs) => {
+                println!("Loaded file system from disk ({} files)", fs.node_count());
+                fs
+            }
+            Err(e) => {
+                println!("Creating new file system: {}", e);
+                let mut fs = GraphFileSystem::new();
+                // Create meaningful sample files that demonstrate semantic similarity
+                let sample_files = vec![
+                    ("readme.md", "Project documentation and setup instructions for the neural operating system"),
+                    ("config.yaml", "Configuration settings for kernel modules and neural networks"),
+                    ("notes.txt", "Personal notes about machine learning and AI research"),
+                    ("todo.txt", "Task list: implement embeddings, test similarity, optimize performance"),
+                    ("report.md", "Research report on semantic file systems and graph databases"),
+                ];
+                for (name, content) in sample_files {
+                    let path = format!("/home/user/{}", name);
+                    fs.create_file(name.to_string(), path, content.to_string());
+                }
+                fs
+            }
+        };
+        
+        // Initialize embedding service and generate embeddings at boot
+        println!("[Hardware] Initializing file embeddings...");
+        match file_system.init_embedding_service("text_embedding_model.onnx", "tokenizer.json") {
+            Ok(_) => {
+                println!("[Hardware] ✓ Embedding service initialized");
+                // Generate embeddings for all files at boot
+                match file_system.update_graph_with_embeddings() {
+                    Ok(_) => println!("[Hardware] ✓ File embeddings generated and graph updated"),
+                    Err(e) => eprintln!("[Hardware] ✗ Failed to generate embeddings: {}", e),
+                }
+            }
+            Err(e) => {
+                eprintln!("[Hardware] ✗ Failed to initialize embedding service: {}", e);
+                eprintln!("[Hardware] File system will work without semantic embeddings");
+            }
         }
+
+        // Create channels for SLM communication
+        let (stream_tx, stream_rx) = mpsc::channel();
+        let (intent_tx, intent_rx) = mpsc::channel();
 
         Self {
             ram: [empty_block; RAM_SIZE],
             cpu_load: [0.0; CPU_CORES],
             processes: Vec::new(),
-            files,
+            file_system,
             selected_file_id: None,
             current_mindset: KernelMindset::Idle,
             system_state: SystemState::new(),
             tick: 0,
             shell_buffer: String::new(),
+            shell_cursor: 0,
+            backspace_held_frames: 0,
             model_session: None,
             vae_session: None,
             theme_engine: None,
             scheduler_session: None,
             rl_scheduler_enabled: false,  // Default OFF
+            vae_enabled: true,            // VAE neural defrag ON by default
+            theme_enabled: true,          // Theme engine ON by default
+            embeddings_enabled: true,     // File embeddings ON by default
             last_scheduled_process: None,
             rl_decision_flash: 0.0,
             target_fps: 60,
             cpu_pressure: 0.0,
+            stream_tx,
+            stream_rx,
+            intent_tx,
+            intent_rx,
+            partial_response: String::new(),
+            is_thinking: false,
+            kernel_messages: VecDeque::new(),
+            openai_available: false,
+            openai_api_key: None,
             process_counter: 0,
         }
+    }
+    
+    /// Save the file system to disk
+    pub fn save_file_system(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.file_system.save_to_file("fugue_filesystem.dat")?;
+        println!("File system saved ({} files)", self.file_system.node_count());
+        Ok(())
     }
 
     fn get_scheduler_state(&self) -> Vec<f32> {
@@ -249,6 +329,7 @@ impl VirtualHardware {
     }
 
     pub fn neural_defrag(&mut self) {
+        if !self.vae_enabled { return; }  // Skip if VAE disabled
         if let Some(session) = &mut self.vae_session {
             // 1. Flatten RAM into 0.0, 0.5, 1.0 for the AI
             let input_data: Vec<f32> = self.ram.iter().map(|b| {
@@ -311,30 +392,8 @@ impl VirtualHardware {
     }
 
     fn update_file_system(&mut self) {
-        let len = self.files.len();
-        for i in 0..len {
-            for j in 0..len {
-                if i == j { continue; }
-                let dx = self.files[i].x - self.files[j].x;
-                let dy = self.files[i].y - self.files[j].y;
-                let dist_sq = dx*dx + dy*dy;
-                if dist_sq > 0.1 && dist_sq < 10000.0 {
-                    let force = 40.0 / dist_sq;
-                    self.files[i].vx += dx * force;
-                    self.files[i].vy += dy * force;
-                }
-            }
-        }
-        for node in self.files.iter_mut() {
-            let dx = 400.0 - node.x; 
-            let dy = 300.0 - node.y; 
-            node.vx += dx * 0.005;
-            node.vy += dy * 0.005;
-            node.x += node.vx;
-            node.y += node.vy;
-            node.vx *= 0.90;
-            node.vy *= 0.90;
-        }
+        // Use GraphFileSystem's built-in physics update
+        self.file_system.update_physics();
     }
 
     pub fn update_physics(&mut self) {
@@ -344,13 +403,13 @@ impl VirtualHardware {
         // Update mindset naturally
         self.update_mindset();
         
-        // Force Rescheduling mode when RL is enabled and under pressure
-        // This overrides the natural state only when RL is on
-        if self.rl_scheduler_enabled && self.cpu_pressure > 0.5 {
-            self.current_mindset = KernelMindset::Rescheduling;
-        }
+        // Automatically enable RL scheduler when in Rescheduling or OptimizingRAM mode
+        self.rl_scheduler_enabled = matches!(
+            self.current_mindset, 
+            KernelMindset::Rescheduling | KernelMindset::OptimizingRAM
+        );
 
-        // --- Trigger Neural Defrag ---
+        // --- Trigger Neural Defrag (every 60 frames to match RL timing) ---
         if self.current_mindset == KernelMindset::OptimizingRAM && self.tick % 60 == 0 {
             self.neural_defrag();
         }
@@ -361,15 +420,23 @@ impl VirtualHardware {
             if p.lifespan < u32::MAX { p.lifespan -= 1; }
         }
         
-        // Calculate CPU pressure
+        // Calculate CPU pressure from total demand (ALWAYS recalculated from processes)
         let total_demand: f32 = self.processes.iter().map(|p| p.cpu_impact).sum();
         self.cpu_pressure = (total_demand / (CPU_CORES as f32 * 0.8)).clamp(0.0, 1.0);
         
-        // RL-based process scheduling
-        if self.rl_scheduler_enabled 
-            && self.current_mindset == KernelMindset::Rescheduling 
-            && !self.processes.is_empty() 
-        {
+        // FPS based on cpu_pressure (checked every frame)
+        if self.cpu_pressure > 0.7 {
+            self.target_fps = 15;
+        } else if self.cpu_pressure > 0.5 {
+            self.target_fps = 25;
+        } else if self.cpu_pressure > 0.3 {
+            self.target_fps = 40;
+        } else {
+            self.target_fps = 60;
+        }
+        
+        // RL-based process scheduling - reduces work, which lowers pressure naturally
+        if self.rl_scheduler_enabled && !self.processes.is_empty() {
             // Get state first before borrowing scheduler
             let state = self.get_scheduler_state();
             
@@ -377,42 +444,43 @@ impl VirtualHardware {
                 let input_array = Array2::from_shape_vec((1, 20), state).unwrap();
                 let input_tensor = Value::from_array(input_array).unwrap();
                 
-                let outputs = scheduler.run(ort::inputs!["state" => input_tensor]).unwrap();
-                let action_probs = outputs["action_probs"].try_extract_tensor::<f32>().unwrap();
-                
-                // Select best action (process to schedule)
-                let best_slot = action_probs.1.iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                    .map(|(idx, _)| idx)
-                    .unwrap();
-                
-                // Execute the scheduling decision
-                if best_slot < self.processes.len() {
-                    self.last_scheduled_process = Some(best_slot);
-                    self.rl_decision_flash = 1.0;
-                    
-                    let process = &mut self.processes[best_slot];
-                    
-                    // RL throttles stress tests to maintain responsiveness
-                    if process.is_stress_test {
-                        process.remaining_work = (process.remaining_work - 0.3).max(0.0);  // Throttled
-                    } else {
-                        process.remaining_work = (process.remaining_work - 1.0).max(0.0);  // Normal
-                    }
-                    process.current_wait = 0.0;
-                    
-                    // Update wait times for other processes
-                    for (i, p) in self.processes.iter_mut().enumerate() {
-                        if i != best_slot && p.remaining_work > 0.0 {
-                            p.current_wait += 1.0;
+                match scheduler.run(ort::inputs!["state" => input_tensor]) {
+                    Ok(outputs) => {
+                        let action_probs = outputs["action_probs"].try_extract_tensor::<f32>().unwrap();
+                        
+                        // Select best action (process to schedule)
+                        let best_slot = action_probs.1.iter()
+                            .enumerate()
+                            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                            .map(|(idx, _)| idx)
+                            .unwrap();
+                        
+                        // Execute the scheduling decision
+                        if best_slot < self.processes.len() {
+                            self.last_scheduled_process = Some(best_slot);
+                            self.rl_decision_flash = 1.0;
+                            
+                            let process = &mut self.processes[best_slot];
+                            
+                            // RL reduces work on processes (which naturally lowers pressure)
+                            if process.is_stress_test {
+                                process.remaining_work = (process.remaining_work - 0.3).max(0.0);  // Throttled
+                            } else {
+                                process.remaining_work = (process.remaining_work - 1.0).max(0.0);  // Normal
+                            }
+                            process.current_wait = 0.0;
+                            
+                            // Update wait times for other processes
+                            for (i, p) in self.processes.iter_mut().enumerate() {
+                                if i != best_slot && p.remaining_work > 0.0 {
+                                    p.current_wait += 1.0;
+                                }
+                            }
                         }
                     }
+                    Err(_) => {}
                 }
             }
-            
-            // Set target FPS to 60 when RL is managing load
-            self.target_fps = 60;
             
             // Visual "cheat": Increase heat on stress test RAM blocks when under pressure
             if self.cpu_pressure > 0.7 {
@@ -428,27 +496,18 @@ impl VirtualHardware {
             // Clear RL scheduling indicators
             self.last_scheduled_process = None;
             
-            // Without RL: Stress tests cause frame drops
-            if self.cpu_pressure > 0.7 {
-                self.target_fps = 20;  // Dramatic slowdown
-            } else if self.cpu_pressure > 0.5 {
-                self.target_fps = 40;
+            // Fallback to simple scheduling when RL not active
+            let total_capacity = CPU_CORES as f32 * 0.8;
+            if total_demand > total_capacity {
+                let starvation_factor = (total_demand - total_capacity) / self.processes.len() as f32;
+                for p in self.processes.iter_mut() {
+                    p.current_wait += starvation_factor * rng.random_range(0.5..1.5);
+                }
             } else {
-                self.target_fps = 60;
+                for p in self.processes.iter_mut() {
+                    p.current_wait = (p.current_wait - 0.1).max(0.0);
+                }
             }
-            // Fallback to simple scheduling when not in Rescheduling mode
-        let total_demand: f32 = self.processes.iter().map(|p| p.cpu_impact).sum();
-        let total_capacity = CPU_CORES as f32 * 0.8;
-        if total_demand > total_capacity {
-            let starvation_factor = (total_demand - total_capacity) / self.processes.len() as f32;
-            for p in self.processes.iter_mut() {
-                p.current_wait += starvation_factor * rng.random_range(0.5..1.5);
-            }
-        } else {
-            for p in self.processes.iter_mut() {
-                p.current_wait = (p.current_wait - 0.1).max(0.0);
-            }
-        }
         }
         
         // CPU load distribution - different behavior based on RL mode
@@ -468,9 +527,9 @@ impl VirtualHardware {
         } else {
             // Simple mode: Standard target_per_core logic - less efficient
             let target_per_core = (self.cpu_pressure).clamp(0.0, 1.0);  // Uses full pressure
-        for i in 0..CPU_CORES {
-            let variance = rng.random_range(-0.02..0.02);
-            let target = (target_per_core + variance).clamp(0.0, 1.0);
+            for i in 0..CPU_CORES {
+                let variance = rng.random_range(-0.02..0.02);
+                let target = (target_per_core + variance).clamp(0.0, 1.0);
                 self.cpu_load[i] += (target - self.cpu_load[i]) * 0.08; // Slower, uniform
             }
         }
