@@ -27,7 +27,7 @@ const CYBER_THEME: Theme = Theme {
     glitch: Color::MAGENTA,
 };
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum AppType {
     SysMonitor,
     Terminal,
@@ -117,11 +117,32 @@ impl DesktopEnv {
         };
 
         let pid = hw.spawn_process(title, cpu_cost, ram_cost, true, true);
-        let offset = (self.windows.len() as f32) * 30.0;
+        
+        // Smart placement: bottom-right first, then tile horizontally
+        let screen_w = 1280.0;
+        let screen_h = 800.0;
+        let taskbar_h = 40.0;
+        let padding = 10.0;
+        
+        // Calculate grid layout
+        let num_windows = self.windows.len();
+        
+        // Horizontal spacing: fit windows from right to left
+        let windows_per_row = (((screen_w - padding) / (w + padding)) as usize).max(1);
+        let row = num_windows / windows_per_row;
+        let col = num_windows % windows_per_row;
+        
+        // Start from bottom-right, move left, then up
+        let x = screen_w - (col as f32 + 1.0) * (w + padding);
+        let y = (screen_h - taskbar_h) - (row as f32 + 1.0) * (h + padding);
+        
+        // Clamp to ensure visibility
+        let x = x.max(padding).min(screen_w - w - padding);
+        let y = y.max(padding).min(screen_h - h - taskbar_h - padding);
         
         self.windows.push(Window {
             title: title.to_string(),
-            rect: Rectangle::new(50.0 + offset, 50.0 + offset, w, h),
+            rect: Rectangle::new(x, y, w, h),
             app_type,
             is_open: true,
             process_id: Some(pid),
@@ -222,12 +243,27 @@ impl DesktopEnv {
                 if ctx.window_idx < self.windows.len() {
                     let win = &mut self.windows[ctx.window_idx];
                     
-                    // Apply lag to window dragging based on FPS
-                    let drag_speed = if hw.target_fps < 60 {
-                        0.1 + (hw.target_fps as f32 / 60.0) * 0.9
+                    // Apply extreme lag to window dragging based on FPS - very noticeable
+                    let base_drag_speed = if hw.target_fps <= 15 {
+                        0.08  // Nearly frozen
+                    } else if hw.target_fps <= 25 {
+                        0.15  // Very laggy
+                    } else if hw.target_fps <= 40 {
+                        0.35  // Noticeably laggy
+                    } else if hw.target_fps <= 50 {
+                        0.65  // Slight lag
+                    } else {
+                        1.0   // Smooth
+                    };
+                    
+                    // Add stuttering effect at low FPS using tick
+                    let stutter_multiplier = if hw.target_fps < 30 && hw.tick % 3 == 0 {
+                        0.3  // Skip some frames
                     } else {
                         1.0
                     };
+                    
+                    let drag_speed = base_drag_speed * stutter_multiplier;
                     
                     let mut target_x = mouse_pos.x - ctx.offset_x;
                     let mut target_y = mouse_pos.y - ctx.offset_y;

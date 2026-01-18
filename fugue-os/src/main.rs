@@ -81,12 +81,22 @@ fn main() {
                                     _ => None
                                 };
                                 if let Some(app_type) = app {
-                                    desktop.open_window(&mut os_hw, app_type);
+                                    // Open N instances (default 1, max 20 for safety)
+                                    let count = intent.count.unwrap_or(1).min(20);
+                                    for _ in 0..count {
+                                        desktop.open_window(&mut os_hw, app_type.clone());
+                                    }
+                                    if count > 1 {
+                                        os_hw.kernel_messages.push_front(
+                                            format!("[SYS] Spawned {} instances of {:?}", count, app_type)
+                                        );
+                                    }
                                 }
                             }
                         }
                         "close" => {
                             if let Some(ref target) = intent.target {
+                                let count = intent.count.unwrap_or(1) as usize;
                                 match target.to_lowercase().as_str() {
                                     "all" => {
                                         while !desktop.windows.is_empty() {
@@ -94,18 +104,24 @@ fn main() {
                                         }
                                     }
                                     "monitor" => {
-                                        if let Some(idx) = desktop.windows.iter().position(|w| w.app_type == AppType::SysMonitor) {
-                                            desktop.close_window(&mut os_hw, idx);
+                                        for _ in 0..count {
+                                            if let Some(idx) = desktop.windows.iter().position(|w| w.app_type == AppType::SysMonitor) {
+                                                desktop.close_window(&mut os_hw, idx);
+                                            } else { break; }
                                         }
                                     }
                                     "terminal" => {
-                                        if let Some(idx) = desktop.windows.iter().position(|w| w.app_type == AppType::Terminal) {
-                                            desktop.close_window(&mut os_hw, idx);
+                                        for _ in 0..count {
+                                            if let Some(idx) = desktop.windows.iter().position(|w| w.app_type == AppType::Terminal) {
+                                                desktop.close_window(&mut os_hw, idx);
+                                            } else { break; }
                                         }
                                     }
                                     "files" => {
-                                        if let Some(idx) = desktop.windows.iter().position(|w| w.app_type == AppType::FileUniverse) {
-                                            desktop.close_window(&mut os_hw, idx);
+                                        for _ in 0..count {
+                                            if let Some(idx) = desktop.windows.iter().position(|w| w.app_type == AppType::FileUniverse) {
+                                                desktop.close_window(&mut os_hw, idx);
+                                            } else { break; }
                                         }
                                     }
                                     _ => {}

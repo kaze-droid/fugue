@@ -398,8 +398,8 @@ impl VirtualHardware {
             KernelMindset::Rescheduling | KernelMindset::OptimizingRAM
         );
 
-        // --- Trigger Neural Defrag ---
-        if self.current_mindset == KernelMindset::OptimizingRAM && self.tick % 60 == 0 {
+        // --- Trigger Neural Defrag (40 frames = 50% faster than reference 60) ---
+        if self.current_mindset == KernelMindset::OptimizingRAM && self.tick % 40 == 0 {
             self.neural_defrag();
         }
 
@@ -409,11 +409,11 @@ impl VirtualHardware {
             if p.lifespan < u32::MAX { p.lifespan -= 1; }
         }
         
-        // Calculate CPU pressure
+        // Calculate CPU pressure DIRECTLY from demand (reference approach - SIMPLE)
         let total_demand: f32 = self.processes.iter().map(|p| p.cpu_impact).sum();
         self.cpu_pressure = (total_demand / (CPU_CORES as f32 * 0.8)).clamp(0.0, 1.0);
         
-        // FPS always based on cpu_pressure - high pressure = laggy system
+        // FPS based on cpu_pressure - SAME thresholds as working reference
         if self.cpu_pressure > 0.7 {
             self.target_fps = 15;
         } else if self.cpu_pressure > 0.5 {
@@ -424,10 +424,8 @@ impl VirtualHardware {
             self.target_fps = 60;
         }
         
-        // RL-based process scheduling - reduces pressure over time
-        if self.rl_scheduler_enabled 
-            && !self.processes.is_empty() 
-        {
+        // RL-based process scheduling - 50% faster than reference
+        if self.rl_scheduler_enabled && !self.processes.is_empty() {
             // Get state first before borrowing scheduler
             let state = self.get_scheduler_state();
             
@@ -452,11 +450,12 @@ impl VirtualHardware {
                     
                     let process = &mut self.processes[best_slot];
                     
-                    // RL throttles stress tests to maintain responsiveness
+                    // RL throttles stress tests (50% faster: 0.3 → 0.45)
                     if process.is_stress_test {
-                        process.remaining_work = (process.remaining_work - 0.3).max(0.0);  // Throttled
+                        process.remaining_work = (process.remaining_work - 0.45).max(0.0);
                     } else {
-                        process.remaining_work = (process.remaining_work - 1.0).max(0.0);  // Normal
+                        // Normal processes (50% faster: 1.0 → 1.5)
+                        process.remaining_work = (process.remaining_work - 1.5).max(0.0);
                     }
                     process.current_wait = 0.0;
                     
@@ -467,8 +466,8 @@ impl VirtualHardware {
                         }
                     }
                     
-                    // RL actively reduces pressure by smart scheduling
-                    self.cpu_pressure = (self.cpu_pressure - 0.03).max(0.0);
+                    // RL reduces pressure (50% faster: 0.03 → 0.045)
+                    self.cpu_pressure = (self.cpu_pressure - 0.045).max(0.0);
                 }
             }
             
@@ -477,7 +476,7 @@ impl VirtualHardware {
                 for block in self.ram.iter_mut() {
                     if let Some(pid) = block.owner_pid {
                         if self.processes.iter().any(|p| p.id == pid && p.is_stress_test) {
-                            block.heat = (block.heat + 0.3).min(2.0);  // Make it look hot!
+                            block.heat = (block.heat + 0.3).min(2.0);
                         }
                     }
                 }
@@ -487,10 +486,9 @@ impl VirtualHardware {
             self.last_scheduled_process = None;
             
             // Fallback to simple scheduling when RL not active
-            let total_demand: f32 = self.processes.iter().map(|p| p.cpu_impact).sum();
             let total_capacity = CPU_CORES as f32 * 0.8;
             if total_demand > total_capacity {
-                let starvation_factor = (total_demand - total_capacity) / self.processes.len() as f32;
+                let starvation_factor = (total_demand - total_capacity) / self.processes.len().max(1) as f32;
                 for p in self.processes.iter_mut() {
                     p.current_wait += starvation_factor * rng.random_range(0.5..1.5);
                 }
@@ -503,25 +501,24 @@ impl VirtualHardware {
         
         // CPU load distribution - different behavior based on RL mode
         if self.rl_scheduler_enabled && self.current_mindset == KernelMindset::Rescheduling {
-            // RL mode: Efficient scheduling - CPU cores go down quickly
-            let target_per_core = (self.cpu_pressure * 0.6).clamp(0.0, 1.0);  // RL keeps it lower
+            // RL mode: Fast decay (50% faster: 0.4 → 0.6)
+            let target_per_core = (self.cpu_pressure * 0.6).clamp(0.0, 1.0);
             for i in 0..CPU_CORES {
                 let variance = rng.random_range(-0.03..0.03);
                 let target = (target_per_core + variance).clamp(0.0, 1.0);
-                // Fast decay when RL is optimizing
                 if self.cpu_load[i] > target {
-                    self.cpu_load[i] += (target - self.cpu_load[i]) * 0.4; // Quick drop
+                    self.cpu_load[i] += (target - self.cpu_load[i]) * 0.6; // 50% faster drop
                 } else {
-                    self.cpu_load[i] += (target - self.cpu_load[i]) * 0.15; // Normal rise
+                    self.cpu_load[i] += (target - self.cpu_load[i]) * 0.15;
                 }
             }
         } else {
-            // Simple mode: Standard target_per_core logic - less efficient
-            let target_per_core = (self.cpu_pressure).clamp(0.0, 1.0);  // Uses full pressure
+            // Simple mode: Standard behavior (matches reference)
+            let target_per_core = self.cpu_pressure.clamp(0.0, 1.0);
             for i in 0..CPU_CORES {
                 let variance = rng.random_range(-0.02..0.02);
                 let target = (target_per_core + variance).clamp(0.0, 1.0);
-                self.cpu_load[i] += (target - self.cpu_load[i]) * 0.08; // Slower, uniform
+                self.cpu_load[i] += (target - self.cpu_load[i]) * 0.08;
             }
         }
         for block in self.ram.iter_mut() { block.heat *= 0.98; }
