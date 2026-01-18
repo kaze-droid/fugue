@@ -11,4 +11,5 @@ raylib = "5.5.1"
 tokenizers = "0.19"  # HuggingFace tokenizers for text embedding
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-ureq = "2.10"  # HTTP client for Ollama API
+ureq = "2.10"  # HTTP client for OpenAI API
+dotenvy = "0.15"  # Load .env file

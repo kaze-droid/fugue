@@ -126,7 +126,7 @@ pub struct VirtualHardware {
     pub rl_decision_flash: f32,  // Visual flash when RL makes a decision
     pub target_fps: u32,  // Target FPS for frame limiting
     pub cpu_pressure: f32,  // Overall CPU pressure (0.0 to 1.0)
-    // SLM Shell Integration (Ollama API)
+    // SLM Shell Integration (OpenAI API)
     pub stream_tx: Sender<String>,
     pub stream_rx: Receiver<String>,
     pub intent_tx: Sender<crate::slm::ShellIntent>,
@@ -134,7 +134,8 @@ pub struct VirtualHardware {
     pub partial_response: String,
     pub is_thinking: bool,
     pub kernel_messages: VecDeque<String>,
-    pub ollama_available: bool,  // Track if Ollama is running
+    pub openai_available: bool,  // Track if OpenAI API key is set
+    pub openai_api_key: Option<String>,  // OpenAI API key from .env
     process_counter: u32,
 }
 
@@ -178,17 +179,20 @@ impl VirtualHardware {
             }
         }
 
-        // Check if Ollama is available
-        println!("[Hardware] Checking Ollama API availability...");
-        match ureq::get("http://localhost:11434/api/tags").call() {
-            Ok(_) => {
-                self.ollama_available = true;
-                println!("[Hardware] ✓ Ollama API is available");
+        // Load OpenAI API key from .env
+        println!("[Hardware] Loading OpenAI API key...");
+        let _ = dotenvy::dotenv(); // Try to load .env file (ignore if missing)
+        match std::env::var("OPENAI_API_KEY") {
+            Ok(key) if !key.is_empty() => {
+                self.openai_api_key = Some(key);
+                self.openai_available = true;
+                println!("[Hardware] ✓ OpenAI API key loaded");
             }
-            Err(e) => {
-                self.ollama_available = false;
-                eprintln!("[Hardware] ✗ Ollama not available: {}", e);
-                eprintln!("[Hardware] Make sure Ollama is running: ollama serve");
+            _ => {
+                self.openai_available = false;
+                self.openai_api_key = None;
+                eprintln!("[Hardware] ✗ OPENAI_API_KEY not found in .env");
+                eprintln!("[Hardware] Create a .env file with: OPENAI_API_KEY=sk-...");
             }
         }
     }
@@ -205,11 +209,17 @@ impl VirtualHardware {
             Err(e) => {
                 println!("Creating new file system: {}", e);
                 let mut fs = GraphFileSystem::new();
-                for i in 0..15 {
-                    let name = format!("node_{:02X}.txt", i);
+                // Create meaningful sample files that demonstrate semantic similarity
+                let sample_files = vec![
+                    ("readme.md", "Project documentation and setup instructions for the neural operating system"),
+                    ("config.yaml", "Configuration settings for kernel modules and neural networks"),
+                    ("notes.txt", "Personal notes about machine learning and AI research"),
+                    ("todo.txt", "Task list: implement embeddings, test similarity, optimize performance"),
+                    ("report.md", "Research report on semantic file systems and graph databases"),
+                ];
+                for (name, content) in sample_files {
                     let path = format!("/home/user/{}", name);
-                    let content = format!("Sample content for file {}", i);
-                    fs.create_file(name, path, content);
+                    fs.create_file(name.to_string(), path, content.to_string());
                 }
                 fs
             }
@@ -267,7 +277,8 @@ impl VirtualHardware {
             partial_response: String::new(),
             is_thinking: false,
             kernel_messages: VecDeque::new(),
-            ollama_available: false,
+            openai_available: false,
+            openai_api_key: None,
             process_counter: 0,
         }
     }
@@ -398,8 +409,8 @@ impl VirtualHardware {
             KernelMindset::Rescheduling | KernelMindset::OptimizingRAM
         );
 
-        // --- Trigger Neural Defrag (40 frames = 50% faster than reference 60) ---
-        if self.current_mindset == KernelMindset::OptimizingRAM && self.tick % 40 == 0 {
+        // --- Trigger Neural Defrag (every 60 frames to match RL timing) ---
+        if self.current_mindset == KernelMindset::OptimizingRAM && self.tick % 60 == 0 {
             self.neural_defrag();
         }
 
@@ -409,11 +420,11 @@ impl VirtualHardware {
             if p.lifespan < u32::MAX { p.lifespan -= 1; }
         }
         
-        // Calculate CPU pressure DIRECTLY from demand (reference approach - SIMPLE)
+        // Calculate CPU pressure from total demand (ALWAYS recalculated from processes)
         let total_demand: f32 = self.processes.iter().map(|p| p.cpu_impact).sum();
         self.cpu_pressure = (total_demand / (CPU_CORES as f32 * 0.8)).clamp(0.0, 1.0);
         
-        // FPS based on cpu_pressure - SAME thresholds as working reference
+        // FPS based on cpu_pressure (checked every frame)
         if self.cpu_pressure > 0.7 {
             self.target_fps = 15;
         } else if self.cpu_pressure > 0.5 {
@@ -424,7 +435,7 @@ impl VirtualHardware {
             self.target_fps = 60;
         }
         
-        // RL-based process scheduling - 50% faster than reference
+        // RL-based process scheduling - reduces work, which lowers pressure naturally
         if self.rl_scheduler_enabled && !self.processes.is_empty() {
             // Get state first before borrowing scheduler
             let state = self.get_scheduler_state();
@@ -433,41 +444,41 @@ impl VirtualHardware {
                 let input_array = Array2::from_shape_vec((1, 20), state).unwrap();
                 let input_tensor = Value::from_array(input_array).unwrap();
                 
-                let outputs = scheduler.run(ort::inputs!["state" => input_tensor]).unwrap();
-                let action_probs = outputs["action_probs"].try_extract_tensor::<f32>().unwrap();
-                
-                // Select best action (process to schedule)
-                let best_slot = action_probs.1.iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                    .map(|(idx, _)| idx)
-                    .unwrap();
-                
-                // Execute the scheduling decision
-                if best_slot < self.processes.len() {
-                    self.last_scheduled_process = Some(best_slot);
-                    self.rl_decision_flash = 1.0;
-                    
-                    let process = &mut self.processes[best_slot];
-                    
-                    // RL throttles stress tests (50% faster: 0.3 → 0.45)
-                    if process.is_stress_test {
-                        process.remaining_work = (process.remaining_work - 0.45).max(0.0);
-                    } else {
-                        // Normal processes (50% faster: 1.0 → 1.5)
-                        process.remaining_work = (process.remaining_work - 1.5).max(0.0);
-                    }
-                    process.current_wait = 0.0;
-                    
-                    // Update wait times for other processes
-                    for (i, p) in self.processes.iter_mut().enumerate() {
-                        if i != best_slot && p.remaining_work > 0.0 {
-                            p.current_wait += 1.0;
+                match scheduler.run(ort::inputs!["state" => input_tensor]) {
+                    Ok(outputs) => {
+                        let action_probs = outputs["action_probs"].try_extract_tensor::<f32>().unwrap();
+                        
+                        // Select best action (process to schedule)
+                        let best_slot = action_probs.1.iter()
+                            .enumerate()
+                            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                            .map(|(idx, _)| idx)
+                            .unwrap();
+                        
+                        // Execute the scheduling decision
+                        if best_slot < self.processes.len() {
+                            self.last_scheduled_process = Some(best_slot);
+                            self.rl_decision_flash = 1.0;
+                            
+                            let process = &mut self.processes[best_slot];
+                            
+                            // RL reduces work on processes (which naturally lowers pressure)
+                            if process.is_stress_test {
+                                process.remaining_work = (process.remaining_work - 0.3).max(0.0);  // Throttled
+                            } else {
+                                process.remaining_work = (process.remaining_work - 1.0).max(0.0);  // Normal
+                            }
+                            process.current_wait = 0.0;
+                            
+                            // Update wait times for other processes
+                            for (i, p) in self.processes.iter_mut().enumerate() {
+                                if i != best_slot && p.remaining_work > 0.0 {
+                                    p.current_wait += 1.0;
+                                }
+                            }
                         }
                     }
-                    
-                    // RL reduces pressure (50% faster: 0.03 → 0.045)
-                    self.cpu_pressure = (self.cpu_pressure - 0.045).max(0.0);
+                    Err(_) => {}
                 }
             }
             
@@ -476,7 +487,7 @@ impl VirtualHardware {
                 for block in self.ram.iter_mut() {
                     if let Some(pid) = block.owner_pid {
                         if self.processes.iter().any(|p| p.id == pid && p.is_stress_test) {
-                            block.heat = (block.heat + 0.3).min(2.0);
+                            block.heat = (block.heat + 0.3).min(2.0);  // Make it look hot!
                         }
                     }
                 }
@@ -488,7 +499,7 @@ impl VirtualHardware {
             // Fallback to simple scheduling when RL not active
             let total_capacity = CPU_CORES as f32 * 0.8;
             if total_demand > total_capacity {
-                let starvation_factor = (total_demand - total_capacity) / self.processes.len().max(1) as f32;
+                let starvation_factor = (total_demand - total_capacity) / self.processes.len() as f32;
                 for p in self.processes.iter_mut() {
                     p.current_wait += starvation_factor * rng.random_range(0.5..1.5);
                 }
@@ -501,24 +512,25 @@ impl VirtualHardware {
         
         // CPU load distribution - different behavior based on RL mode
         if self.rl_scheduler_enabled && self.current_mindset == KernelMindset::Rescheduling {
-            // RL mode: Fast decay (50% faster: 0.4 → 0.6)
-            let target_per_core = (self.cpu_pressure * 0.6).clamp(0.0, 1.0);
+            // RL mode: Efficient scheduling - CPU cores go down quickly
+            let target_per_core = (self.cpu_pressure * 0.6).clamp(0.0, 1.0);  // RL keeps it lower
             for i in 0..CPU_CORES {
                 let variance = rng.random_range(-0.03..0.03);
                 let target = (target_per_core + variance).clamp(0.0, 1.0);
+                // Fast decay when RL is optimizing
                 if self.cpu_load[i] > target {
-                    self.cpu_load[i] += (target - self.cpu_load[i]) * 0.6; // 50% faster drop
+                    self.cpu_load[i] += (target - self.cpu_load[i]) * 0.4; // Quick drop
                 } else {
-                    self.cpu_load[i] += (target - self.cpu_load[i]) * 0.15;
+                    self.cpu_load[i] += (target - self.cpu_load[i]) * 0.15; // Normal rise
                 }
             }
         } else {
-            // Simple mode: Standard behavior (matches reference)
-            let target_per_core = self.cpu_pressure.clamp(0.0, 1.0);
+            // Simple mode: Standard target_per_core logic - less efficient
+            let target_per_core = (self.cpu_pressure).clamp(0.0, 1.0);  // Uses full pressure
             for i in 0..CPU_CORES {
                 let variance = rng.random_range(-0.02..0.02);
                 let target = (target_per_core + variance).clamp(0.0, 1.0);
-                self.cpu_load[i] += (target - self.cpu_load[i]) * 0.08;
+                self.cpu_load[i] += (target - self.cpu_load[i]) * 0.08; // Slower, uniform
             }
         }
         for block in self.ram.iter_mut() { block.heat *= 0.98; }

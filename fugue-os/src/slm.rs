@@ -1,8 +1,10 @@
-// src/slm.rs - SLM Shell Integration for Fugue OS (Ollama API)
+// src/slm.rs - SLM Shell Integration for Fugue OS (OpenAI API)
 
 use std::sync::mpsc::Sender;
 use serde::{Deserialize, Serialize};
 use std::io::BufRead;
+use std::time::Duration;
+use std::thread;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShellIntent {
@@ -22,17 +24,35 @@ fn default_count() -> Option<u32> {
     Some(1)
 }
 
+// OpenAI API structures
 #[derive(Serialize)]
-struct OllamaRequest {
+struct OpenAIRequest {
     model: String,
-    prompt: String,
+    messages: Vec<OpenAIMessage>,
     stream: bool,
+    max_tokens: u32,
+}
+
+#[derive(Serialize)]
+struct OpenAIMessage {
+    role: String,
+    content: String,
 }
 
 #[derive(Deserialize)]
-struct OllamaResponse {
-    response: String,
-    done: bool,
+struct OpenAIStreamResponse {
+    choices: Vec<OpenAIStreamChoice>,
+}
+
+#[derive(Deserialize)]
+struct OpenAIStreamChoice {
+    delta: OpenAIDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OpenAIDelta {
+    content: Option<String>,
 }
 
 const SYSTEM_PROMPT: &str = r#"You are the Fugue-OS Kernel Executive, a snarky, high-performance neural controller.
@@ -85,25 +105,35 @@ Output: {"action": "create", "value": "todo.txt", "response": "Spawning new node
 
 Now respond to this user command with ONLY valid JSON:"#;
 
-/// Run inference using Ollama API with streaming
-pub fn run_ollama_inference(
+/// Run inference using OpenAI API with streaming
+pub fn run_openai_inference(
     user_prompt: String,
+    api_key: &str,
     stream_tx: Sender<String>,
 ) -> Option<ShellIntent> {
-    let full_prompt = format!("{}\n\nUser: {}", SYSTEM_PROMPT, user_prompt);
-    
-    let request = OllamaRequest {
-        model: "phi3.5".to_string(),
-        prompt: full_prompt,
+    let request = OpenAIRequest {
+        model: "gpt-4o-mini".to_string(),  // Fast and cheap
+        messages: vec![
+            OpenAIMessage {
+                role: "system".to_string(),
+                content: SYSTEM_PROMPT.to_string(),
+            },
+            OpenAIMessage {
+                role: "user".to_string(),
+                content: user_prompt,
+            },
+        ],
         stream: true,
+        max_tokens: 256,
     };
     
     let mut full_response = String::new();
     
-    // Make streaming HTTP request to Ollama
+    // Make streaming HTTP request to OpenAI
     let json_body = serde_json::to_string(&request).unwrap();
-    match ureq::post("http://localhost:11434/api/generate")
+    match ureq::post("https://api.openai.com/v1/chat/completions")
         .set("Content-Type", "application/json")
+        .set("Authorization", &format!("Bearer {}", api_key))
         .send_string(&json_body)
     {
         Ok(response) => {
@@ -111,13 +141,28 @@ pub fn run_ollama_inference(
             
             for line_result in reader.lines() {
                 if let Ok(line) = line_result {
-                    if let Ok(chunk) = serde_json::from_str::<OllamaResponse>(&line) {
-                        // Send token for streaming display
-                        let _ = stream_tx.send(chunk.response.clone());
-                        full_response.push_str(&chunk.response);
-                        
-                        if chunk.done {
+                    // OpenAI SSE format: "data: {...}"
+                    if line.starts_with("data: ") {
+                        let data = &line[6..];
+                        if data == "[DONE]" {
                             break;
+                        }
+                        
+                        if let Ok(chunk) = serde_json::from_str::<OpenAIStreamResponse>(data) {
+                            if let Some(choice) = chunk.choices.first() {
+                                if let Some(content) = &choice.delta.content {
+                                    // Send token for streaming display
+                                    let _ = stream_tx.send(content.clone());
+                                    full_response.push_str(content);
+                                    
+                                    // Add 500ms delay between tokens for dramatic effect
+                                    thread::sleep(Duration::from_millis(500));
+                                }
+                                
+                                if choice.finish_reason.is_some() {
+                                    break;
+                                }
+                            }
                         }
                         
                         // Try to parse JSON early if we see a closing brace
@@ -136,7 +181,7 @@ pub fn run_ollama_inference(
             }
         }
         Err(e) => {
-            eprintln!("[SLM] Failed to connect to Ollama: {}", e);
+            eprintln!("[SLM] Failed to connect to OpenAI: {}", e);
             return None;
         }
     }

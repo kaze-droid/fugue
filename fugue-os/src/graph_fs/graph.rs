@@ -58,13 +58,21 @@ impl GraphNode {
     }
 
     pub fn get_text_for_embedding(&self) -> String {
-        // Include name, path, and content for better semantic matching
-        let content_preview = if self.content.len() > 200 {
-            &self.content[..200]
+        // Prioritize content for semantic matching, name as secondary context
+        // Use up to 500 chars of content (embedding models handle ~512 tokens well)
+        let content_text = if self.content.len() > 500 {
+            &self.content[..500]
         } else {
             &self.content
         };
-        format!("{} {} {}", self.name, self.path, content_preview)
+        
+        // Content first (most important), then filename for context
+        if content_text.is_empty() {
+            // Fallback to name if no content
+            self.name.clone()
+        } else {
+            format!("{} [file: {}]", content_text, self.name)
+        }
     }
 }
 
@@ -83,9 +91,42 @@ impl GraphFileSystem {
             nodes: HashMap::new(),
             edges: HashMap::new(),
             next_id: 0,
-            similarity_threshold: 0.85, // Very strict: only connect truly similar files (85%+)
+            similarity_threshold: 0.6, // Connect files with 60%+ similarity for visible graph structure
             embedding_service: None,
         }
+    }
+    
+    /// Find a node by name (case-insensitive partial match)
+    pub fn find_node_by_name(&self, name: &str) -> Option<&GraphNode> {
+        let name_lower = name.to_lowercase();
+        self.nodes.values()
+            .find(|n| n.name.to_lowercase().contains(&name_lower))
+    }
+    
+    /// Find a node by exact name
+    pub fn find_node_by_exact_name(&self, name: &str) -> Option<&GraphNode> {
+        self.nodes.values()
+            .find(|n| n.name == name)
+    }
+    
+    /// Calculate similarity between two nodes (returns 0.0 if either lacks embedding)
+    pub fn calculate_similarity(&self, id1: u32, id2: u32) -> f32 {
+        if let (Some(node1), Some(node2)) = (self.nodes.get(&id1), self.nodes.get(&id2)) {
+            if let (Some(emb1), Some(emb2)) = (&node1.embedding, &node2.embedding) {
+                return cosine_similarity(emb1, emb2);
+            }
+        }
+        0.0
+    }
+    
+    /// Get nodes with embeddings count
+    pub fn nodes_with_embeddings_count(&self) -> usize {
+        self.nodes.values().filter(|n| n.embedding.is_some()).count()
+    }
+    
+    /// Get total edge count (undirected)
+    pub fn edge_count(&self) -> usize {
+        self.edges.values().map(|s| s.len()).sum::<usize>() / 2
     }
 
     pub fn with_threshold(threshold: f32) -> Self {
@@ -231,21 +272,40 @@ impl GraphFileSystem {
             neighbors.clear();
         }
         
+        let mut edges_added = 0;
+        let mut pairs_with_embeddings = 0;
+        
+        // Collect all similarities for logging
+        let mut similarities: Vec<(String, String, f32)> = Vec::new();
+        
         // Compare all pairs
         for i in 0..len {
             for j in (i + 1)..len {
                 if let (Some(node_i), Some(node_j)) = (self.nodes.get(&node_ids[i]), self.nodes.get(&node_ids[j])) {
                     if let (Some(emb_i), Some(emb_j)) = (&node_i.embedding, &node_j.embedding) {
+                        pairs_with_embeddings += 1;
                         let similarity = cosine_similarity(emb_i, emb_j);
                         
-                        // Only connect files with high similarity (threshold is a similarity value, not distance)
+                        similarities.push((node_i.name.clone(), node_j.name.clone(), similarity));
+                        
+                        // Only connect files with high similarity
                         if similarity >= self.similarity_threshold {
                             self.add_edge(node_ids[i], node_ids[j]);
+                            edges_added += 1;
                         }
                     }
                 }
             }
         }
+        
+        // Log top similarities
+        similarities.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+        println!("[GraphFS] Similarity matrix ({} pairs, threshold {:.0}%):", pairs_with_embeddings, self.similarity_threshold * 100.0);
+        for (name_i, name_j, sim) in similarities.iter().take(5) {
+            let connected = if *sim >= self.similarity_threshold { "→" } else { " " };
+            println!("  {} {:.0}% {} <-> {}", connected, sim * 100.0, name_i, name_j);
+        }
+        println!("[GraphFS] Total edges: {}", edges_added);
     }
 
     /// Get the number of nodes
@@ -312,11 +372,12 @@ impl GraphFileSystem {
                 let text = node.get_text_for_embedding();
                 match service.generate_embedding(&text) {
                     Ok(embedding) => {
+                        println!("[GraphFS] ✓ Embedding for '{}': {} dims", node.name, embedding.len());
                         node.embedding = Some(embedding);
                         Ok(())
                     }
                     Err(e) => {
-                        eprintln!("[GraphFileSystem] Failed to generate embedding for node {}: {}", node_id, e);
+                        eprintln!("[GraphFS] ✗ Failed embedding for '{}': {}", node.name, e);
                         Err(e)
                     }
                 }

@@ -191,15 +191,30 @@ fn main() {
                             // Create a new file
                             if let Some(ref filename) = intent.value {
                                 let path = format!("/home/user/{}", filename);
-                                let content = String::new();
+                                // Use value as content if provided, otherwise empty
+                                let content = intent.target.clone().unwrap_or_default();
                                 let file_id = os_hw.file_system.create_file(filename.clone(), path, content);
-                                os_hw.kernel_messages.push_front(
-                                    format!("[FS] Created file '{}' (ID: {:04X})", filename, file_id)
-                                );
+                                
                                 // Update edges if embeddings enabled
                                 if os_hw.embeddings_enabled {
                                     os_hw.file_system.update_edges_by_similarity();
                                 }
+                                
+                                // Persist to disk
+                                if let Err(e) = os_hw.save_file_system() {
+                                    eprintln!("Failed to persist new file: {}", e);
+                                }
+                                
+                                // Report status
+                                let has_embedding = os_hw.file_system.get_node(file_id)
+                                    .map(|n| n.embedding.is_some())
+                                    .unwrap_or(false);
+                                let edge_count = os_hw.file_system.edge_count();
+                                
+                                os_hw.kernel_messages.push_front(
+                                    format!("[FS] Created '{}' [emb: {}, edges: {}] ✓ saved", 
+                                        filename, if has_embedding { "✓" } else { "✗" }, edge_count)
+                                );
                             }
                         }
                         "edit" | "modify" => {
@@ -218,8 +233,12 @@ fn main() {
                                 if let Some(id) = file_id {
                                     if let Some(ref new_content) = intent.value {
                                         if os_hw.file_system.write_file(id, new_content.clone()) {
+                                            // Persist to disk
+                                            if let Err(e) = os_hw.save_file_system() {
+                                                eprintln!("Failed to persist file edit: {}", e);
+                                            }
                                             os_hw.kernel_messages.push_front(
-                                                format!("[FS] Updated file ID {:04X}", id)
+                                                format!("[FS] Updated file ID {:04X} ✓ saved", id)
                                             );
                                         } else {
                                             os_hw.kernel_messages.push_front(
@@ -249,8 +268,12 @@ fn main() {
                                 
                                 if let Some(id) = file_id {
                                     if os_hw.file_system.remove_node(id) {
+                                        // Persist to disk
+                                        if let Err(e) = os_hw.save_file_system() {
+                                            eprintln!("Failed to persist file deletion: {}", e);
+                                        }
                                         os_hw.kernel_messages.push_front(
-                                            format!("[FS] Deleted file ID {:04X}", id)
+                                            format!("[FS] Deleted file ID {:04X} ✓ saved", id)
                                         );
                                     } else {
                                         os_hw.kernel_messages.push_front(
@@ -335,21 +358,22 @@ fn main() {
                             os_hw.kernel_messages.push_front(format!("user@fugue-os:~$ {}", prompt));
                             os_hw.is_thinking = true;
 
-                            // Run Ollama inference in background thread
-                            if os_hw.ollama_available {
+                            // Run OpenAI inference in background thread
+                            if os_hw.openai_available {
                                 let s_tx = os_hw.stream_tx.clone();
                                 let i_tx = os_hw.intent_tx.clone();
                                 let prompt_clone = prompt.clone();
+                                let api_key = os_hw.openai_api_key.clone().unwrap();
                                 
                                 std::thread::spawn(move || {
-                                    if let Some(intent) = crate::slm::run_ollama_inference(prompt_clone, s_tx) {
+                                    if let Some(intent) = crate::slm::run_openai_inference(prompt_clone, &api_key, s_tx) {
                                         println!("[SLM] Parsed intent: {:?}", intent);
                                         let _ = i_tx.send(intent);
                                     }
                                 });
                             } else {
                                 os_hw.is_thinking = false;
-                                os_hw.kernel_messages.push_front("[KERNEL] Ollama not available - start with: ollama serve".to_string());
+                                os_hw.kernel_messages.push_front("[KERNEL] OpenAI API key not found - add OPENAI_API_KEY to .env".to_string());
                             }
                         }
                         

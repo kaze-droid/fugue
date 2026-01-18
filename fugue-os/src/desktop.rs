@@ -742,23 +742,34 @@ impl DesktopEnv {
         let (x, y, w, h) = (r.x as i32, r.y as i32, r.width as i32, r.height as i32);
         d.draw_rectangle(x, y, w, h, Color::BLACK);
         let offset = Vector2::new((r.x + r.width / 2.0) - 400.0, (r.y + r.height / 2.0) - 300.0);
-        let edge_color = Color::new(100, 0, 200, ((d.get_time() * 3.0).sin() * 100.0 + 155.0) as u8);
         
-        // Check if we have search results to highlight
+        // Check if we have search results to highlight (only top 3)
         let search_node_ids: std::collections::HashSet<u32> = self.search_results.iter()
+            .take(3)
             .map(|(id, _, _)| *id)
             .collect();
         
         {
             let mut s = d.begin_scissor_mode(x + 2, y + 2, w - 4, h - 4);
             
-            // Draw edges (connections)
+            // Draw edges (connections) with color based on similarity
             for node in hw.file_system.get_all_nodes() {
                 let connections = hw.file_system.get_connections(node.id);
                 for conn_id in connections {
-                    if let Some(target) = hw.file_system.get_node(conn_id) {
-                        s.draw_line_v(Vector2::new(node.x + offset.x, node.y + offset.y), 
-                                     Vector2::new(target.x + offset.x, target.y + offset.y), edge_color);
+                    if conn_id > node.id { // Avoid drawing edges twice
+                        if let Some(target) = hw.file_system.get_node(conn_id) {
+                            // Calculate similarity for edge color intensity
+                            let similarity = hw.file_system.calculate_similarity(node.id, conn_id);
+                            let intensity = (similarity * 255.0) as u8;
+                            let edge_color = Color::new(100, intensity, 255, 180);
+                            
+                            s.draw_line_ex(
+                                Vector2::new(node.x + offset.x, node.y + offset.y), 
+                                Vector2::new(target.x + offset.x, target.y + offset.y), 
+                                2.0, // Thicker lines for visibility
+                                edge_color
+                            );
+                        }
                     }
                 }
             }
@@ -768,14 +779,17 @@ impl DesktopEnv {
                 let pos = Vector2::new(node.x + offset.x, node.y + offset.y);
                 let sel = Some(node.id) == hw.selected_file_id;
                 let is_search_result = search_node_ids.contains(&node.id);
+                let has_embedding = node.embedding.is_some();
                 
-                // Highlight search results
+                // Highlight based on state
                 let node_color = if is_search_result {
                     Color::GOLD
                 } else if sel {
                     self.theme.accent
+                } else if has_embedding {
+                    Color::new(150, 100, 255, 255) // Brighter purple for embedded nodes
                 } else {
-                    Color::PURPLE
+                    Color::new(80, 50, 120, 255) // Dimmer for nodes without embeddings
                 };
                 
                 let node_size = if is_search_result { 5.0 } else if sel { 6.0 } else { 4.0 };
@@ -787,23 +801,31 @@ impl DesktopEnv {
                 }
                 s.draw_text(&node.name, pos.x as i32 + 8, pos.y as i32 - 5, 10, self.theme.text_dim);
             }
+            
+            // Draw stats in corner
+            let nodes_count = hw.file_system.node_count();
+            let emb_count = hw.file_system.nodes_with_embeddings_count();
+            let edge_count = hw.file_system.edge_count();
+            s.draw_text(&format!("Nodes: {} | Embeddings: {} | Edges: {}", nodes_count, emb_count, edge_count),
+                x + 5, y + h - 15, 10, self.theme.text_dim);
         }
         
         d.draw_rectangle_lines(x, y, w, h, self.theme.accent);
         
-        // Draw search results panel if we have results
+        // Draw search results panel if we have results (top 3 only)
         if !self.search_results.is_empty() {
             let panel_w = 220;
-            let panel_h = 200.min(30 + self.search_results.len() as i32 * 20);
+            let top_results = self.search_results.len().min(3);
+            let panel_h = 30 + top_results as i32 * 22;
             let px = x + 10;
             let py = y + 10;
             
             d.draw_rectangle(px, py, panel_w, panel_h, Color::new(20, 20, 30, 240));
             d.draw_rectangle_lines(px, py, panel_w, panel_h, Color::GOLD);
-            d.draw_text("SEARCH RESULTS", px + 5, py + 5, 10, Color::GOLD);
+            d.draw_text("TOP 3 MATCHES", px + 5, py + 5, 10, Color::GOLD);
             
-            for (i, (node_id, name, score)) in self.search_results.iter().enumerate().take(8) {
-                let ty = py + 25 + i as i32 * 20;
+            for (i, (_node_id, name, score)) in self.search_results.iter().enumerate().take(3) {
+                let ty = py + 25 + i as i32 * 22;
                 let score_pct = (score * 100.0) as i32;
                 let score_color = if score_pct > 80 {
                     Color::GREEN
@@ -813,13 +835,15 @@ impl DesktopEnv {
                     Color::ORANGE
                 };
                 
-                d.draw_text(&format!("{}. {}", i + 1, name), px + 5, ty, 10, Color::WHITE);
+                // Truncate name if too long
+                let display_name = if name.len() > 18 {
+                    format!("{}...", &name[..15])
+                } else {
+                    name.clone()
+                };
+                
+                d.draw_text(&format!("{}. {}", i + 1, display_name), px + 5, ty, 10, Color::WHITE);
                 d.draw_text(&format!("{}%", score_pct), px + panel_w - 35, ty, 10, score_color);
-            }
-            
-            if self.search_results.len() > 8 {
-                d.draw_text(&format!("+{} more...", self.search_results.len() - 8), 
-                           px + 5, py + panel_h - 15, 10, self.theme.text_dim);
             }
         }
         
