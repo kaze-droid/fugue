@@ -206,6 +206,20 @@ impl GraphFileSystem {
             neighbors.remove(&from);
         }
     }
+    
+    /// Remove a node and all its edges
+    pub fn remove_node(&mut self, id: u32) -> bool {
+        if self.nodes.remove(&id).is_some() {
+            // Remove all edges to/from this node
+            self.edges.remove(&id);
+            for neighbors in self.edges.values_mut() {
+                neighbors.remove(&id);
+            }
+            true
+        } else {
+            false
+        }
+    }
 
     /// Update edges based on semantic similarity
     pub fn update_edges_by_similarity(&mut self) {

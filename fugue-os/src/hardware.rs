@@ -112,11 +112,16 @@ pub struct VirtualHardware {
     pub system_state: SystemState,
     pub tick: u64,
     pub shell_buffer: String,
+    pub shell_cursor: usize,  // Cursor position in shell_buffer
+    pub backspace_held_frames: u32,  // Track how long backspace is held
     pub model_session: Option<Session>,
     pub vae_session: Option<Session>,
     pub theme_engine: Option<ThemeEngine>,
     pub scheduler_session: Option<Session>,
     pub rl_scheduler_enabled: bool,
+    pub vae_enabled: bool,           // VAE neural defrag
+    pub theme_enabled: bool,         // Theme engine
+    pub embeddings_enabled: bool,    // File embeddings
     pub last_scheduled_process: Option<usize>,  // Track which process was scheduled
     pub rl_decision_flash: f32,  // Visual flash when RL makes a decision
     pub target_fps: u32,  // Target FPS for frame limiting
@@ -124,6 +129,8 @@ pub struct VirtualHardware {
     // SLM Shell Integration (Ollama API)
     pub stream_tx: Sender<String>,
     pub stream_rx: Receiver<String>,
+    pub intent_tx: Sender<crate::slm::ShellIntent>,
+    pub intent_rx: Receiver<crate::slm::ShellIntent>,
     pub partial_response: String,
     pub is_thinking: bool,
     pub kernel_messages: VecDeque<String>,
@@ -227,6 +234,7 @@ impl VirtualHardware {
 
         // Create channels for SLM communication
         let (stream_tx, stream_rx) = mpsc::channel();
+        let (intent_tx, intent_rx) = mpsc::channel();
 
         Self {
             ram: [empty_block; RAM_SIZE],
@@ -238,17 +246,24 @@ impl VirtualHardware {
             system_state: SystemState::new(),
             tick: 0,
             shell_buffer: String::new(),
+            shell_cursor: 0,
+            backspace_held_frames: 0,
             model_session: None,
             vae_session: None,
             theme_engine: None,
             scheduler_session: None,
             rl_scheduler_enabled: false,  // Default OFF
+            vae_enabled: true,            // VAE neural defrag ON by default
+            theme_enabled: true,          // Theme engine ON by default
+            embeddings_enabled: true,     // File embeddings ON by default
             last_scheduled_process: None,
             rl_decision_flash: 0.0,
             target_fps: 60,
             cpu_pressure: 0.0,
             stream_tx,
             stream_rx,
+            intent_tx,
+            intent_rx,
             partial_response: String::new(),
             is_thinking: false,
             kernel_messages: VecDeque::new(),
@@ -303,6 +318,7 @@ impl VirtualHardware {
     }
 
     pub fn neural_defrag(&mut self) {
+        if !self.vae_enabled { return; }  // Skip if VAE disabled
         if let Some(session) = &mut self.vae_session {
             // 1. Flatten RAM into 0.0, 0.5, 1.0 for the AI
             let input_data: Vec<f32> = self.ram.iter().map(|b| {
